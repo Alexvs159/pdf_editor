@@ -105,7 +105,8 @@ class PdfDocument:
     def _embedded_font_buffer(self, page, font_name: str) -> bytes | None:
         """Буфер встроенного шрифта, совпадающего по имени, или None."""
         target = _clean_font_name(font_name).lower()
-        for xref, ext, _ftype, basefont, _refname, _enc in page.get_fonts(full=True):
+        for row in page.get_fonts(full=True):
+            xref, ext, _ftype, basefont, _refname, _enc = row[:6]
             if ext == "n/a" or _clean_font_name(basefont).lower() != target:
                 continue
             _name, _ext, _type, buf = self.doc.extract_font(xref)

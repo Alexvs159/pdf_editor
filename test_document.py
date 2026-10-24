@@ -66,7 +66,8 @@ def test_save_same_file() -> None:
 
 
 def test_base14_mapping() -> None:
-    assert _base14_key("ABCDEF+TimesNewRomanPS-BoldMT") == "times-romanbold"
+    key = _base14_key("ABCDEF+TimesNewRomanPS-BoldMT")
+    assert key == "times-bold" and pymupdf.Base14_fontdict[key] == "Times-Bold"
     assert _base14_key("Arial-Bold") == "helvetica-bold"
     # точное имя из словаря возвращается как есть
     key = _base14_key("Helvetica-Oblique")

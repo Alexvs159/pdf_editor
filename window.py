@@ -2,7 +2,7 @@
 import os
 
 from PyQt6.QtCore import QRectF, QSize, Qt
-from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPen, QPixmap, QShortcut
+from PyQt6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
@@ -95,12 +95,11 @@ class MainWindow(QMainWindow):
         self.thumbs.clear()
         for i in range(self.doc.page_count):
             pix = self.doc.thumbnail_pixmap(i)
-            item = QListWidgetItem(QPixmap.fromImage(pixmap_to_qimage(pix)), f"Стр. {i + 1}")
+            item = QListWidgetItem(QIcon(QPixmap.fromImage(pixmap_to_qimage(pix))), f"Стр. {i + 1}")
             item.setData(Qt.ItemDataRole.UserRole, i)
             self.thumbs.addItem(item)
         self.thumbs.blockSignals(False)
-        self.thumbs.setCurrentRow(0 if self.doc.page_count else -1)
-        self.select_page(self.thumbs.currentRow())
+        self.thumbs.setCurrentRow(0)
 
     def open_file_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Открыть PDF", "", "PDF (*.pdf)")
@@ -160,7 +159,7 @@ class MainWindow(QMainWindow):
         # После правки страница другая — перерисовываем (выделение сбрасывается).
         self.select_page(self.page_idx)
         self.thumbs.currentItem().setIcon(
-            QPixmap.fromImage(pixmap_to_qimage(self.doc.thumbnail_pixmap(self.page_idx)))
+            QIcon(QPixmap.fromImage(pixmap_to_qimage(self.doc.thumbnail_pixmap(self.page_idx))))
         )
         self.info.setText("Изменено (Ctrl+S — сохранить)")
 
@@ -168,7 +167,3 @@ class MainWindow(QMainWindow):
         # shortcut: автосохранения нет, несохранённые правки теряются без
         # предупреждения; добавить вопрос при закрытии, когда появится undo.
         event.accept()
-
-
-if __name__ == "__main__":
-    run()

@@ -1,4 +1,5 @@
 """Модель PDF-редактора: рендер, блоки текста, правка блоков. Без GUI."""
+import html as _html
 from dataclasses import dataclass
 
 import pymupdf
@@ -32,12 +33,36 @@ def _base14_key(name: str) -> str:
     serif = any(w in n for w in ("times", "georgia", "serif", "roman"))
     base = "courier" if mono else ("times" if serif else "helvetica")
     if bold and italic:
-        return base + "bolditalic"
+        return base + "-bolditalic"
     if bold:
-        return base + "bold"
+        return base + "-bold"
     if italic:
-        return base + "italic"
+        return base + "-italic"
     return base
+
+
+def _cjk_font(text: str) -> str | None:
+    """Reserved-имя встроенного CJK шрифта, если текст не латиница/кириллица."""
+    for ch in text:
+        o = ord(ch)
+        if 0x3040 <= o <= 0x30FF:
+            return "japan"
+        if 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F or 0xAC00 <= o <= 0xD7AF:
+            return "korea"
+        if 0x3400 <= o <= 0x9FFF:
+            return "china-s"
+    return None
+
+
+def _encoding_flag(text: str) -> int:
+    """Кодировка Base-14 для insert_textbox: греческий/кириллица или латынь."""
+    for ch in text:
+        o = ord(ch)
+        if 0x0400 <= o <= 0x04FF:
+            return pymupdf.TEXT_ENCODING_CYRILLIC
+        if 0x0370 <= o <= 0x03FF:
+            return pymupdf.TEXT_ENCODING_GREEK
+    return pymupdf.TEXT_ENCODING_LATIN
 
 
 class PdfDocument:
@@ -116,23 +141,34 @@ class PdfDocument:
                 page.insert_font(fontname=refname, fontbuffer=buf)
         size = block.size
         rect = pymupdf.Rect(block.rect)
-        for _ in range(int(size * 2)):  # уменьшаем, пока не влезет (мин. 4pt)
-            kw = dict(fontsize=size, color=block.color, align=pymupdf.TEXT_ALIGN_LEFT)
-            if refname:
-                rc = page.insert_textbox(rect, new_text, fontname=refname, **kw)
-            else:
-                rc = page.insert_textbox(
-                    rect, new_text, fontname=_base14_key(block.font), **kw
-                )
-            if rc >= 0:
+        if not new_text.isascii():
+            # Греческий/кириллица/CJK: Base-14 вставляет '?', пишем через Story
+            # (insert_htmlbox): unicode гарантирован, шрифт подбирает движок.
+            r, g, b = block.color
+            body = _html.escape(new_text, quote=False)
+            page.insert_htmlbox(rect, (
+                f'<span style="font-size:{block.size:.1f}pt;'
+                f'color:rgb({r*255:.0f},{g*255:.0f},{b*255:.0f});">{body}</span>'
+            ))
+            return
+        cjk = _cjk_font(new_text)
+        enc = _encoding_flag(new_text)
+
+        def insert(fs: float) -> float:
+            if refname:  # тот же встроенный шрифт
+                return page.insert_textbox(rect, new_text, fontname=refname,
+                                           fontsize=fs, color=block.color,
+                                           align=pymupdf.TEXT_ALIGN_LEFT)
+            key = cjk or _base14_key(block.font)
+            return page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
+                                       fontsize=fs, color=block.color,
+                                       align=pymupdf.TEXT_ALIGN_LEFT)
+
+        while size >= 4:  # уменьшаем, пока текст не влезет в блок (мин. 4pt)
+            if insert(size) >= 0:
                 return
             size -= 0.5
-        # Не влезло даже на 4pt — вставляем 4pt, как трактат docs add_redact_annot.
-        kw["fontsize"] = 4
-        page.insert_textbox(
-            rect, new_text,
-            fontname=refname or _base14_key(block.font), **kw,
-        )
+        insert(4)  # не влезло — вставляем всё равно в 4pt, как у add_redact_annot
 
     def save_as(self, path: str) -> None:
         if path == self.path:

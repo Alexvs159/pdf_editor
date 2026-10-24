@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import pymupdf
 
-# Имена Base-14 шрифтов — любые ключи/значения pymupdf.Base14_fontdict.
 _BASE14 = pymupdf.Base14_fontdict
 
 
@@ -12,18 +11,16 @@ _BASE14 = pymupdf.Base14_fontdict
 class TextBlock:
     rect: pymupdf.Rect
     text: str
-    font: str      # имя шрифта первого спана
-    size: float    # размер первого спана, pt
-    color: tuple   # (r, g, b), значения 0..1
+    font: str
+    size: float
+    color: tuple
 
 
 def _clean_font_name(name: str) -> str:
-    """'ABCDEF+Arial-BoldMT' -> 'Arial-BoldMT'."""
     return name.split("+")[-1].strip()
 
 
 def _base14_key(name: str) -> str:
-    """Подобрать ключ Base-14 шрифта по имени шрифта из PDF."""
     n = _clean_font_name(name).lower()
     if n in _BASE14:
         return n
@@ -42,7 +39,6 @@ def _base14_key(name: str) -> str:
 
 
 def _cjk_font(text: str) -> str | None:
-    """Reserved-имя встроенного CJK шрифта, если текст не латиница/кириллица."""
     for ch in text:
         o = ord(ch)
         if 0x3040 <= o <= 0x30FF:
@@ -55,7 +51,6 @@ def _cjk_font(text: str) -> str | None:
 
 
 def _encoding_flag(text: str) -> int:
-    """Кодировка Base-14 для insert_textbox: греческий/кириллица или латынь."""
     for ch in text:
         o = ord(ch)
         if 0x0400 <= o <= 0x04FF:
@@ -81,7 +76,6 @@ class PdfDocument:
         return self.page_pixmap(idx, zoom=0.2)
 
     def blocks(self, idx: int) -> list[TextBlock]:
-        """Текстовые блоки страницы (только type=0, т.е. обычный текст)."""
         out = []
         for b in self.doc[idx].get_text("dict")["blocks"]:
             if b["type"] != 0:
@@ -102,8 +96,22 @@ class PdfDocument:
             ))
         return out
 
+    def embedded_font_names(self) -> list[str]:
+        """Уникальные имена встроенных шрифтов документа (очищенные)."""
+        out = []
+        seen = set()
+        for page in self.doc:
+            for row in page.get_fonts(full=True):
+                _xref, ext, _ftype, basefont, _ref, _enc = row[:6]
+                if ext == "n/a":
+                    continue
+                name = _clean_font_name(basefont)
+                if name and name not in seen:
+                    seen.add(name)
+                    out.append(name)
+        return out
+
     def _embedded_font_buffer(self, page, font_name: str) -> bytes | None:
-        """Буфер встроенного шрифта, совпадающего по имени, или None."""
         target = _clean_font_name(font_name).lower()
         for row in page.get_fonts(full=True):
             xref, ext, _ftype, basefont, _refname, _enc = row[:6]
@@ -114,14 +122,10 @@ class PdfDocument:
                 return buf
         return None
 
-    def set_text(self, idx: int, block: TextBlock, new_text: str) -> None:
-        """Заменить текст блока: удалить старый (redaction), вставить новый.
-
-        Если new_text пустой, блок просто очищается.
-        """
+    def set_text(self, idx: int, block: TextBlock, new_text: str,
+                 font_choice: str | None = None) -> None:
         page = self.doc[idx]
         page.add_redact_annot(block.rect, fill=False)
-        # Картинки и векторную графику не трогаем, удаляем только текст.
         page.apply_redactions(
             images=pymupdf.PDF_REDACT_IMAGE_NONE,
             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
@@ -129,51 +133,108 @@ class PdfDocument:
         if not new_text:
             return
 
-        # Шрифт: 1) тот же встроенный, 2) Base-14 с тем же именем,
-        # 3) похожий Base-14. Буфер субсета может не иметь нужных глифов
-        # для новых символов — известное ограничение.
         clean = _clean_font_name(block.font)
-        refname = None
-        if clean.lower() not in _BASE14:
-            # Для зарезервированных имён Base-14 insert_font игнорирует буфер.
-            buf = self._embedded_font_buffer(page, block.font)
-            if buf is not None:
-                refname = "EdF" + "".join(ch for ch in clean if ch.isalnum())[:32]
-                page.insert_font(fontname=refname, fontbuffer=buf)
         size = block.size
         rect = pymupdf.Rect(block.rect)
-        if not new_text.isascii():
-            # Греческий/кириллица/CJK: Base-14 вставляет '?', пишем через Story
-            # (insert_htmlbox): unicode гарантирован, шрифт подбирает движок.
-            r, g, b = block.color
+        r, g, b = block.color
+
+        def htmlbox() -> None:
             body = _html.escape(new_text, quote=False)
             page.insert_htmlbox(rect, (
                 f'<span style="font-size:{block.size:.1f}pt;'
                 f'color:rgb({r*255:.0f},{g*255:.0f},{b*255:.0f});">{body}</span>'
             ))
-            return
-        cjk = _cjk_font(new_text)
-        enc = _encoding_flag(new_text)
 
-        def insert(fs: float) -> float:
-            if refname:  # тот же встроенный шрифт
-                return page.insert_textbox(rect, new_text, fontname=refname,
-                                           fontsize=fs, color=block.color,
-                                           align=pymupdf.TEXT_ALIGN_LEFT)
-            key = cjk or _base14_key(block.font)
-            return page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
-                                       fontsize=fs, color=block.color,
-                                       align=pymupdf.TEXT_ALIGN_LEFT)
+        # Встроенный шрифт оригинального блока (если есть).
+        original_refname = None
+        if clean.lower() not in _BASE14:
+            buf = self._embedded_font_buffer(page, block.font)
+            if buf is not None:
+                original_refname = "EdF" + "".join(ch for ch in clean if ch.isalnum())[:32]
+                page.insert_font(fontname=original_refname, fontbuffer=buf)
 
-        while size >= 4:  # уменьшаем, пока текст не влезет в блок (мин. 4pt)
-            if insert(size) >= 0:
+        # 1. Явно выбранный пользователем шрифт.
+        if font_choice and font_choice not in ("auto", None):
+            if font_choice.startswith("emb:"):
+                name = font_choice[4:]
+                buf = self._embedded_font_buffer(page, name)
+                if buf is not None:
+                    ref = "EdF" + "".join(ch for ch in name if ch.isalnum())[:32]
+                    page.insert_font(fontname=ref, fontbuffer=buf)
+                    s = size
+                    while s >= 4:
+                        if page.insert_textbox(rect, new_text, fontname=ref,
+                                             fontsize=s, color=block.color,
+                                             align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
+                            return
+                        s -= 0.5
+                    page.insert_textbox(rect, new_text, fontname=ref, fontsize=4,
+                                       color=block.color, align=pymupdf.TEXT_ALIGN_LEFT)
+                    return
+            else:
+                key = font_choice
+                enc = _encoding_flag(new_text)
+                s = size
+                while s >= 4:
+                    if page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
+                                         fontsize=s, color=block.color,
+                                         align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
+                        return
+                    s -= 0.5
+                page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
+                                   fontsize=4, color=block.color,
+                                   align=pymupdf.TEXT_ALIGN_LEFT)
                 return
-            size -= 0.5
-        insert(4)  # не влезло — вставляем всё равно в 4pt, как у add_redact_annot
+            htmlbox()
+            return
+
+        # 2. Авто: сохранить исходный встроенный шрифт.
+        if original_refname is not None:
+            s = size
+            while s >= 4:
+                if page.insert_textbox(rect, new_text, fontname=original_refname,
+                                     fontsize=s, color=block.color,
+                                     align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
+                    return
+                s -= 0.5
+            page.insert_textbox(rect, new_text, fontname=original_refname,
+                               fontsize=4, color=block.color,
+                               align=pymupdf.TEXT_ALIGN_LEFT)
+            return
+
+        # 3. Авто: ASCII — похожий Base-14; CJK — reserved name.
+        cjk = _cjk_font(new_text) if not new_text.isascii() else None
+        if cjk is not None:
+            key = cjk
+            enc = pymupdf.TEXT_ENCODING_LATIN
+            s = size
+            while s >= 4:
+                if page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
+                                     fontsize=s, color=block.color,
+                                     align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
+                    return
+                s -= 0.5
+            page.insert_textbox(rect, new_text, fontname=key, encoding=enc, fontsize=4,
+                               color=block.color, align=pymupdf.TEXT_ALIGN_LEFT)
+            return
+        if not new_text.isascii():
+            # кириллица/греческий без встроенного шрифта — только htmlbox (unicode)
+            htmlbox()
+            return
+        key = _base14_key(block.font)
+        enc = pymupdf.TEXT_ENCODING_LATIN
+        s = size
+        while s >= 4:
+            if page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
+                                 fontsize=s, color=block.color,
+                                 align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
+                return
+            s -= 0.5
+        page.insert_textbox(rect, new_text, fontname=key, encoding=enc, fontsize=4,
+                           color=block.color, align=pymupdf.TEXT_ALIGN_LEFT)
 
     def save_as(self, path: str) -> None:
         if path == self.path:
-            # Тот же файл: только инкрементально, с сохранением шифрования.
             self.doc.save(self.path, incremental=True, encryption=pymupdf.PDF_ENCRYPT_KEEP)
         else:
             self.doc.save(path)

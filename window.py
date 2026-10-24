@@ -4,7 +4,7 @@ import os
 from PyQt6.QtCore import QRectF, QSize, Qt
 from PyQt6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QListWidget,
+    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QGraphicsRectItem, QGraphicsScene, QGraphicsView, QSplitter, QWidget,
 )
@@ -52,6 +52,12 @@ class MainWindow(QMainWindow):
         self.info.setWordWrap(True)
         self.font_combo = QComboBox()
         self.font_combo.addItem("Авто (сохранить исходный)", "auto")
+        self.size_spin = QDoubleSpinBox()
+        self.size_spin.setRange(4.0, 72.0)
+        self.size_spin.setSingleStep(0.5)
+        self.size_spin.setDecimals(1)
+        self.size_spin.setSuffix(" pt")
+        self.size_spin.setValue(12.0)
         self.editor = QPlainTextEdit()
         apply_btn = QPushButton("Применить (Ctrl+Enter)")
         apply_btn.clicked.connect(self.apply_edit)
@@ -59,12 +65,13 @@ class MainWindow(QMainWindow):
         undo_btn.clicked.connect(self.undo)
         grid.addWidget(self.info, 0, 0)
         grid.addWidget(self.font_combo, 1, 0)
-        grid.addWidget(self.editor, 2, 0)
+        grid.addWidget(self.size_spin, 2, 0)
+        grid.addWidget(self.editor, 3, 0)
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         btn_row.addWidget(undo_btn)
         btn_row.addWidget(apply_btn)
-        grid.addLayout(btn_row, 3, 0)
+        grid.addLayout(btn_row, 4, 0)
         right.setFixedWidth(360)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -119,7 +126,8 @@ class MainWindow(QMainWindow):
             if val in seen:
                 continue
             seen.add(val)
-            self.font_combo.addItem(val, _key)
+            # данные — короткое зарезервированное имя (метрики корректны)
+            self.font_combo.addItem(val, _base14_key(val))
         for cjk in ("china-s", "china-ss", "japan", "korea"):
             self.font_combo.addItem(f"CJK: {cjk}", cjk)
         self.font_combo.blockSignals(False)
@@ -157,6 +165,8 @@ class MainWindow(QMainWindow):
             r.setPen(QPen(QColor(30, 90, 220, 160), 1))
             r.setBrush(QColor(30, 90, 220, 30))
             r.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable)
+            r.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable)
+            r.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges)
             r.setData(0, n)
             self.scene.addItem(r)
         if not self.blocks:
@@ -170,6 +180,7 @@ class MainWindow(QMainWindow):
         self.selected = items[0].data(0)
         self.info.setText(f"Шрифт: {b.font} · {b.size:g} pt")
         self.editor.setPlainText(b.text)
+        self.size_spin.setValue(b.size)
         clean = _clean_font_name(b.font)
         i = self.font_combo.findData(f"emb:{clean}")
         if i < 0:
@@ -186,8 +197,19 @@ class MainWindow(QMainWindow):
         if len(self._undo_stack) > 20:
             self._undo_stack.pop(0)
         choice = self.font_combo.currentData()
+        # Если блок перемещали мышью — вставляем в новое место.
+        target = None
+        for it in self.scene.items():
+            if isinstance(it, QGraphicsRectItem) and it.data(0) == self.selected:
+                sr = it.sceneBoundingRect()
+                target = pymupdf.Rect(sr.x() / VIEW_ZOOM, sr.y() / VIEW_ZOOM,
+                                      (sr.x() + sr.width()) / VIEW_ZOOM,
+                                      (sr.y() + sr.height()) / VIEW_ZOOM)
+                break
         try:
-            self.doc.set_text(self.page_idx, b, self.editor.toPlainText(), font_choice=choice)
+            self.doc.set_text(self.page_idx, b, self.editor.toPlainText(),
+                             font_choice=choice, font_size=self.size_spin.value(),
+                             insert_rect=target)
         except Exception as e:
             QMessageBox.critical(self, "PDF Editor", f"Ошибка редактирования:\n{e}")
             return

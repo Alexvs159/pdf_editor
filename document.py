@@ -20,22 +20,38 @@ def _clean_font_name(name: str) -> str:
     return name.split("+")[-1].strip()
 
 
+# Короткие зарезервированные имена Base-14: MuPDF считает метрики по-разному
+# для "helv" и "helvetica", длинное имя даёт ложный дефицит ширины и вечную
+# усадку при повторных правках. Вставляем только по коротким именам.
+_FULL_TO_SHORT = {
+    "helvetica": "helv", "helvetica-oblique": "heit",
+    "helvetica-bold": "hebo", "helvetica-boldoblique": "hebi",
+    "courier": "cour", "courier-oblique": "coit",
+    "courier-bold": "cobo", "courier-boldoblique": "cobi",
+    "times-roman": "tiro", "times-italic": "tiit",
+    "times-bold": "tibo", "times-bolditalic": "tibi",
+    "symbol": "symb", "zapfdingbats": "zadb",
+}
+
+
 def _base14_key(name: str) -> str:
     n = _clean_font_name(name).lower()
-    if n in _BASE14:
+    if n in _FULL_TO_SHORT:
+        return _FULL_TO_SHORT[n]
+    if n in _BASE14:  # уже короткое зарезервированное имя
         return n
     bold = "bold" in n
     italic = "italic" in n or "oblique" in n
     mono = any(w in n for w in ("mono", "courier", "consolas"))
     serif = any(w in n for w in ("times", "georgia", "serif", "roman"))
-    base = "courier" if mono else ("times" if serif else "helvetica")
+    fam = "co" if mono else ("ti" if serif else "he")
     if bold and italic:
-        return base + "-bolditalic"
+        return fam + "bi"
     if bold:
-        return base + "-bold"
+        return fam + "bo"
     if italic:
-        return base + "-italic"
-    return base
+        return fam + "it"
+    return fam
 
 
 def _cjk_font(text: str) -> str | None:
@@ -51,7 +67,8 @@ def _cjk_font(text: str) -> str | None:
 
 
 def _insert_fit(page, rect, text, fontname, encoding, start_size, color) -> bool:
-    """Вставить текст, уменьшая шрифт до 4pt. True, если влезло."""
+    """Вставить текст, уменьшая шрифт до 4pt. Ничего не вставляет, если
+    не влезло даже так (вызывающий решает fallback); True, если влезло."""
     s = start_size
     while s >= 4:
         if page.insert_textbox(rect, text, fontname=fontname, encoding=encoding,
@@ -59,8 +76,6 @@ def _insert_fit(page, rect, text, fontname, encoding, start_size, color) -> bool
                              align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
             return True
         s -= 0.5
-    page.insert_textbox(rect, text, fontname=fontname, encoding=encoding,
-                       fontsize=4, color=color, align=pymupdf.TEXT_ALIGN_LEFT)
     return False
 
 
@@ -126,9 +141,29 @@ class PdfDocument:
                 return buf
         return None
 
+    def _first_span_bbox(self, page, near: pymupdf.Rect) -> pymupdf.Rect | None:
+        """bbox первого (верхнего левого) спана с центром внутри near."""
+        best = None
+        for b in page.get_text("dict")["blocks"]:
+            if b["type"] != 0:
+                continue
+            for line in b["lines"]:
+                for s in line["spans"]:
+                    if not s["text"].strip():
+                        continue
+                    r = pymupdf.Rect(s["bbox"])
+                    cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+                    if near.x0 <= cx <= near.x1 and near.y0 <= cy <= near.y1:
+                        if best is None or (r.y0, r.x0) < (best.y0, best.x0):
+                            best = r
+        return best
+
     def set_text(self, idx: int, block: TextBlock, new_text: str,
-                 font_choice: str | None = None) -> None:
+                 font_choice: str | None = None,
+                 font_size: float | None = None,
+                 insert_rect: pymupdf.Rect | None = None) -> None:
         page = self.doc[idx]
+        # Redaction всегда по исходному прямоугольнику блока.
         page.add_redact_annot(block.rect, fill=False)
         page.apply_redactions(
             images=pymupdf.PDF_REDACT_IMAGE_NONE,
@@ -137,17 +172,43 @@ class PdfDocument:
         if not new_text:
             return
 
+        size = font_size if font_size else block.size
+        target = pymupdf.Rect(insert_rect) if insert_rect is not None else pymupdf.Rect(block.rect)
+        # Глифы стартуют от origin бокса вставки, а плотный bbox из get_text
+        # не оставляет места на межстрочный интервал; после apply_redactions
+        # MuPDF ещё и пересоздаёт ресурс шрифта с большей метрикой — поэтому
+        # запас вправо/вниз, но не влево/вверх (иначе блок "уползает" и
+        # текст уменьшается при каждой правке).
+        box = target + (0, 0, 6, 6)
         clean = _clean_font_name(block.font)
-        size = block.size
-        rect = pymupdf.Rect(block.rect)
         r, g, b = block.color
 
         def htmlbox() -> None:
             body = _html.escape(new_text, quote=False)
-            page.insert_htmlbox(rect, (
-                f'<span style="font-size:{block.size:.1f}pt;'
+            html = (
+                f'<span style="font-size:{size:.1f}pt;'
                 f'color:rgb({r*255:.0f},{g*255:.0f},{b*255:.0f});">{body}</span>'
-            ))
+            )
+
+            def do(bx: pymupdf.Rect) -> None:
+                rc = page.insert_htmlbox(bx, html, scale_low=1.0)
+                if isinstance(rc, tuple) and rc and rc[0] < 0:
+                    page.insert_htmlbox(bx, html, scale_low=0.0)
+
+            do(box)
+            # Story кладёт глифы со своим внутренним отступом (зависит от
+            # шрифта/size, магической константы нет): измеряем и перставляем
+            # со сдвигом, иначе блок "уползает" при каждой правке.
+            bb = self._first_span_bbox(page, box)
+            if bb is not None:
+                dx, dy = target.x0 - bb.x0, target.y0 - bb.y0
+                if abs(dx) > 0.25 or abs(dy) > 0.25:
+                    page.add_redact_annot(bb + (-0.5, -0.5, 0.5, 0.5), fill=False)
+                    page.apply_redactions(
+                        images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                        graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                    )
+                    do(pymupdf.Rect(box.x0 + dx, box.y0 + dy, box.x1 + dx, box.y1 + dy))
 
         # shortcut: redaction применён до вставки; если вставка упадёт, блок
         # уже пуст. Вызывающие (GUI) обязаны сохранить снимок до вызова;
@@ -170,9 +231,9 @@ class PdfDocument:
                 if buf is not None:
                     ref = "EdF" + "".join(ch for ch in name if ch.isalnum())[:32]
                     page.insert_font(fontname=ref, fontbuffer=buf)
-                    _insert_fit(page, rect, new_text, ref, pymupdf.TEXT_ENCODING_LATIN,
-                                size, block.color)
-                    return
+                    if _insert_fit(page, box, new_text, ref, pymupdf.TEXT_ENCODING_LATIN,
+                                   size, block.color):
+                        return
             else:
                 # Base-14 / CJK. Кириллица/греческий в Base-14 дают '?',
                 # поэтому для не-ascii (кроме CJK) используем htmlbox.
@@ -180,32 +241,35 @@ class PdfDocument:
                         "china-s", "china-ss", "japan", "korea"):
                     htmlbox()
                     return
-                _insert_fit(page, rect, new_text, font_choice,
-                            pymupdf.TEXT_ENCODING_LATIN, size, block.color)
+                if not _insert_fit(page, box, new_text, _base14_key(font_choice),
+                                   pymupdf.TEXT_ENCODING_LATIN, size, block.color):
+                    htmlbox()
                 return
             htmlbox()
             return
 
         # 2. Авто: сохранить исходный встроенный шрифт.
         if original_refname is not None:
-            _insert_fit(page, rect, new_text, original_refname,
-                        pymupdf.TEXT_ENCODING_LATIN, size, block.color)
-            return
+            if _insert_fit(page, box, new_text, original_refname,
+                        pymupdf.TEXT_ENCODING_LATIN, size, block.color):
+                return
+            # субсет не содержит нужных глифов — пробуем дальше
 
         # 3. Авто: CJK — reserved name.
         cjk = _cjk_font(new_text) if not new_text.isascii() else None
         if cjk is not None:
-            _insert_fit(page, rect, new_text, cjk, pymupdf.TEXT_ENCODING_LATIN,
+            _insert_fit(page, box, new_text, cjk, pymupdf.TEXT_ENCODING_LATIN,
                         size, block.color)
             return
         # Кириллица/греческий без встроенного шрифта — только htmlbox (unicode).
         if not new_text.isascii():
             htmlbox()
             return
-        # ASCII — похожий Base-14.
+        # ASCII — похожий Base-14; не влезло — htmlbox (сохранит размер).
         key = _base14_key(block.font)
-        _insert_fit(page, rect, new_text, key, pymupdf.TEXT_ENCODING_LATIN,
-                    size, block.color)
+        if not _insert_fit(page, box, new_text, key, pymupdf.TEXT_ENCODING_LATIN,
+                           size, block.color):
+            htmlbox()
 
     def save_as(self, path: str) -> None:
         if path == self.path:

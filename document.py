@@ -50,14 +50,18 @@ def _cjk_font(text: str) -> str | None:
     return None
 
 
-def _encoding_flag(text: str) -> int:
-    for ch in text:
-        o = ord(ch)
-        if 0x0400 <= o <= 0x04FF:
-            return pymupdf.TEXT_ENCODING_CYRILLIC
-        if 0x0370 <= o <= 0x03FF:
-            return pymupdf.TEXT_ENCODING_GREEK
-    return pymupdf.TEXT_ENCODING_LATIN
+def _insert_fit(page, rect, text, fontname, encoding, start_size, color) -> bool:
+    """Вставить текст, уменьшая шрифт до 4pt. True, если влезло."""
+    s = start_size
+    while s >= 4:
+        if page.insert_textbox(rect, text, fontname=fontname, encoding=encoding,
+                             fontsize=s, color=color,
+                             align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
+            return True
+        s -= 0.5
+    page.insert_textbox(rect, text, fontname=fontname, encoding=encoding,
+                       fontsize=4, color=color, align=pymupdf.TEXT_ALIGN_LEFT)
+    return False
 
 
 class PdfDocument:
@@ -145,6 +149,9 @@ class PdfDocument:
                 f'color:rgb({r*255:.0f},{g*255:.0f},{b*255:.0f});">{body}</span>'
             ))
 
+        # shortcut: redaction применён до вставки; если вставка упадёт, блок
+        # уже пуст. Вызывающие (GUI) обязаны сохранить снимок до вызова;
+        # библиотечные вызовы без снимка теряют текст при сбое.
         # Встроенный шрифт оригинального блока (если есть).
         original_refname = None
         if clean.lower() not in _BASE14:
@@ -152,6 +159,8 @@ class PdfDocument:
             if buf is not None:
                 original_refname = "EdF" + "".join(ch for ch in clean if ch.isalnum())[:32]
                 page.insert_font(fontname=original_refname, fontbuffer=buf)
+                # shortcut: встроенный субсет может не содержать глифов для
+                # новых символов -> tofu; апгрейд: htmlbox-fallback при обнаружении.
 
         # 1. Явно выбранный пользователем шрифт.
         if font_choice and font_choice not in ("auto", None):
@@ -161,77 +170,42 @@ class PdfDocument:
                 if buf is not None:
                     ref = "EdF" + "".join(ch for ch in name if ch.isalnum())[:32]
                     page.insert_font(fontname=ref, fontbuffer=buf)
-                    s = size
-                    while s >= 4:
-                        if page.insert_textbox(rect, new_text, fontname=ref,
-                                             fontsize=s, color=block.color,
-                                             align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
-                            return
-                        s -= 0.5
-                    page.insert_textbox(rect, new_text, fontname=ref, fontsize=4,
-                                       color=block.color, align=pymupdf.TEXT_ALIGN_LEFT)
+                    _insert_fit(page, rect, new_text, ref, pymupdf.TEXT_ENCODING_LATIN,
+                                size, block.color)
                     return
             else:
-                key = font_choice
-                enc = _encoding_flag(new_text)
-                s = size
-                while s >= 4:
-                    if page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
-                                         fontsize=s, color=block.color,
-                                         align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
-                        return
-                    s -= 0.5
-                page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
-                                   fontsize=4, color=block.color,
-                                   align=pymupdf.TEXT_ALIGN_LEFT)
+                # Base-14 / CJK. Кириллица/греческий в Base-14 дают '?',
+                # поэтому для не-ascii (кроме CJK) используем htmlbox.
+                if not new_text.isascii() and font_choice not in (
+                        "china-s", "china-ss", "japan", "korea"):
+                    htmlbox()
+                    return
+                _insert_fit(page, rect, new_text, font_choice,
+                            pymupdf.TEXT_ENCODING_LATIN, size, block.color)
                 return
             htmlbox()
             return
 
         # 2. Авто: сохранить исходный встроенный шрифт.
         if original_refname is not None:
-            s = size
-            while s >= 4:
-                if page.insert_textbox(rect, new_text, fontname=original_refname,
-                                     fontsize=s, color=block.color,
-                                     align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
-                    return
-                s -= 0.5
-            page.insert_textbox(rect, new_text, fontname=original_refname,
-                               fontsize=4, color=block.color,
-                               align=pymupdf.TEXT_ALIGN_LEFT)
+            _insert_fit(page, rect, new_text, original_refname,
+                        pymupdf.TEXT_ENCODING_LATIN, size, block.color)
             return
 
-        # 3. Авто: ASCII — похожий Base-14; CJK — reserved name.
+        # 3. Авто: CJK — reserved name.
         cjk = _cjk_font(new_text) if not new_text.isascii() else None
         if cjk is not None:
-            key = cjk
-            enc = pymupdf.TEXT_ENCODING_LATIN
-            s = size
-            while s >= 4:
-                if page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
-                                     fontsize=s, color=block.color,
-                                     align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
-                    return
-                s -= 0.5
-            page.insert_textbox(rect, new_text, fontname=key, encoding=enc, fontsize=4,
-                               color=block.color, align=pymupdf.TEXT_ALIGN_LEFT)
+            _insert_fit(page, rect, new_text, cjk, pymupdf.TEXT_ENCODING_LATIN,
+                        size, block.color)
             return
+        # Кириллица/греческий без встроенного шрифта — только htmlbox (unicode).
         if not new_text.isascii():
-            # кириллица/греческий без встроенного шрифта — только htmlbox (unicode)
             htmlbox()
             return
+        # ASCII — похожий Base-14.
         key = _base14_key(block.font)
-        enc = pymupdf.TEXT_ENCODING_LATIN
-        s = size
-        while s >= 4:
-            if page.insert_textbox(rect, new_text, fontname=key, encoding=enc,
-                                 fontsize=s, color=block.color,
-                                 align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
-                return
-            s -= 0.5
-        page.insert_textbox(rect, new_text, fontname=key, encoding=enc, fontsize=4,
-                           color=block.color, align=pymupdf.TEXT_ALIGN_LEFT)
+        _insert_fit(page, rect, new_text, key, pymupdf.TEXT_ENCODING_LATIN,
+                    size, block.color)
 
     def save_as(self, path: str) -> None:
         if path == self.path:

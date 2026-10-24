@@ -189,13 +189,14 @@ class MainWindow(QMainWindow):
         try:
             self.doc.set_text(self.page_idx, b, self.editor.toPlainText(), font_choice=choice)
         except Exception as e:
-            self._undo_stack.pop()  # не оставляем фиктивный снимок
             QMessageBox.critical(self, "PDF Editor", f"Ошибка редактирования:\n{e}")
             return
         self.select_page(self.page_idx)
-        self.thumbs.currentItem().setIcon(
-            QIcon(QPixmap.fromImage(pixmap_to_qimage(self.doc.thumbnail_pixmap(self.page_idx))))
-        )
+        item = self.thumbs.currentItem()
+        if item is not None:
+            item.setIcon(
+                QIcon(QPixmap.fromImage(pixmap_to_qimage(self.doc.thumbnail_pixmap(self.page_idx))))
+            )
         self.info.setText("Изменено (Ctrl+Z — отменить)")
 
     def undo(self) -> None:
@@ -218,6 +219,13 @@ class MainWindow(QMainWindow):
         self.info.setText("Отменено (Ctrl+Z)")
 
     def closeEvent(self, event):
-        # shortcut: автосохранения нет, несохранённые правки теряются без
-        # предупреждения; добавить вопрос при закрытии, когда появится undo.
+        if self._undo_stack:
+            reply = QMessageBox.question(
+                self, "PDF Editor", "Есть несохранённые правки. Закрыть без сохранения?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         event.accept()

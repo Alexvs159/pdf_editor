@@ -14,6 +14,10 @@ class TextBlock:
     font: str
     size: float
     color: tuple
+    # Стиль по строкам (первый span каждой строки): font, size, color,
+    # origin=(x, y) базовой линии — для сохранения позиций строк при правке.
+    # None = не извлекалось (TextBlock создан вручную).
+    line_styles: list[dict] | None = None
 
 
 def _clean_font_name(name: str) -> str:
@@ -51,7 +55,8 @@ def _base14_key(name: str) -> str:
         return fam + "bo"
     if italic:
         return fam + "it"
-    return fam
+    # без суффикса — регулярное начертание семейства ("he" — не имя)
+    return {"co": "cour", "ti": "tiro", "he": "helv"}[fam]
 
 
 def _cjk_font(text: str) -> str | None:
@@ -66,28 +71,44 @@ def _cjk_font(text: str) -> str | None:
     return None
 
 
-def _insert_fit(page, rect, text, fontname, encoding, start_size, color) -> bool:
-    """Вставить текст. rc<0 у insert_textbox = дефицит высоты в пунктах:
-    расширяем бокс вниз на недостающее (глифы идут от origin, поэтому
-    позиция первой строки не меняется). Шрифт уменьшаем только когда
-    расширенный бокс выходит за страницу. Ничего не вставляет, если не
-    влезло даже так (вызывающий решает fallback); True, если влезло."""
-    s = start_size
-    page_y1 = page.rect.y1
-    while s >= 4:
-        rc = page.insert_textbox(rect, text, fontname=fontname, encoding=encoding,
-                                 fontsize=s, color=color,
-                                 align=pymupdf.TEXT_ALIGN_LEFT)
-        if rc >= 0:
-            return True
-        bigger = pymupdf.Rect(rect)
-        bigger.y1 = min(bigger.y1 - rc + 2, page_y1)
-        if page.insert_textbox(bigger, text, fontname=fontname, encoding=encoding,
-                               fontsize=s, color=color,
-                               align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
-            return True
+def _insert_text_fit(page, refname, text, x, y, size, color) -> bool:
+    """Одна строка от базовой линии (x, y) БЕЗ переноса по ширине
+    (insert_text позиционирует глифы по точке и ширину строки не
+    ограничивает; "\n" в тексте недопустим — вызывающий разбил по строкам).
+    Шрифт уменьшаем только когда baseline целиком уходит за низ страницы:
+    позицию (x, y) не двигаем — иначе блок дрейфует при повторных правках.
+    rc<0 у insert_text = сбой шрифта; возвращает True, если влезло."""
+    s = size
+    while s >= 4 and y > page.rect.y1 - s * 0.3:
         s -= 0.5
-    return False
+    if s < 4:
+        return False
+    return page.insert_text((x, y), text, fontname=refname, fontsize=s,
+                            color=color,
+                            encoding=pymupdf.TEXT_ENCODING_LATIN) >= 0
+
+
+_story_inset_cache: dict[float, tuple] = {}
+
+
+def _story_inset(size: float) -> tuple:
+    """Внутренний отступ Story-спана от бокса вставки (x, y), зависит
+    только от size. Измеряется один раз на отдельном документе."""
+    if size not in _story_inset_cache:
+        with pymupdf.open() as tmp:
+            page = tmp.new_page()
+            box = pymupdf.Rect(0, 0, 200, size * 2)
+            html = (f'<span style="font-size:{size:.1f}pt;'
+                    f'color:rgb(0,0,0);">Ij</span>')
+            page.insert_htmlbox(box, html, scale_low=0.0)
+            found = [s for b in page.get_text("dict")["blocks"] if b["type"] == 0
+                     for l in b["lines"] for s in l["spans"]]
+            if found:
+                _story_inset_cache[size] = (found[0]["origin"][0] - box.x0,
+                                            found[0]["origin"][1] - box.y0)
+            else:
+                _story_inset_cache[size] = (0.0, 0.0)
+    return _story_inset_cache[size]
 
 
 class PdfDocument:
@@ -110,19 +131,41 @@ class PdfDocument:
         for b in self.doc[idx].get_text("dict")["blocks"]:
             if b["type"] != 0:
                 continue
-            spans = [s for line in b["lines"] for s in line["spans"] if s["text"]]
-            if not spans:
+            line_styles = []
+            for line in b["lines"]:
+                spans = line["spans"]
+                if spans:
+                    s0 = spans[0]  # shortcut: смешение стилей внутри одной
+                    # строки сведено к первому span; апгрейд: посимвольные стили
+                    c = s0["color"]
+                    line_styles.append({
+                        "font": s0["font"],
+                        "size": s0["size"],
+                        "color": ((c >> 16 & 255) / 255, (c >> 8 & 255) / 255,
+                                  (c & 255) / 255),
+                        "origin": tuple(s0["origin"]),
+                    })
+                else:
+                    # пустая строка наследует стиль предыдущей
+                    line_styles.append(dict(line_styles[-1]) if line_styles else {})
+            if not line_styles:
                 continue
             text = "\n".join(
-                "".join(s["text"] for s in line["spans"]) for line in b["lines"]
+                # shortcut: TTF-буферы с LATIN-кодировкой извлекают пробел
+                # как \xa0 (артефакт MuPDF); нормализуем, иначе после правки
+                # \xa0 попадает в редактор и в следующие вставки.
+                "".join(s["text"] for s in line["spans"]).replace("\xa0", " ")
+                for line in b["lines"]
             )
-            c = spans[0]["color"]
+            if not text:
+                continue
             out.append(TextBlock(
                 rect=pymupdf.Rect(b["bbox"]),
                 text=text,
-                font=spans[0]["font"],
-                size=spans[0]["size"],
-                color=((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255),
+                font=line_styles[0]["font"],
+                size=line_styles[0]["size"],
+                color=line_styles[0]["color"],
+                line_styles=line_styles,
             ))
         return out
 
@@ -152,28 +195,32 @@ class PdfDocument:
                 return buf
         return None
 
-    def _first_span_bbox(self, page, near: pymupdf.Rect) -> pymupdf.Rect | None:
-        """bbox первого (верхнего левого) спана с центром внутри near."""
-        best = None
-        for b in page.get_text("dict")["blocks"]:
-            if b["type"] != 0:
+    def _page_font_buffers(self, page) -> dict[str, bytes]:
+        """Буферы встроенных шрифтов страницы. Снимок ДО redaction:
+        MuPDF может удалить ресурс шрифта, если красактом вырезан весь
+        его текст — тогда буфер уже не получить. Ключи — очищенное имя
+        и нормализованное (без пробелов/дефисов): внутреннее имя спана
+        может отличаться от /BaseFont ('DejaVuSans' vs 'DejaVu Sans Book')."""
+        out: dict[str, bytes] = {}
+        for row in page.get_fonts(full=True):
+            xref, ext, _ftype, basefont, _ref, _enc = row[:6]
+            if ext == "n/a":
                 continue
-            for line in b["lines"]:
-                for s in line["spans"]:
-                    if not s["text"].strip():
-                        continue
-                    r = pymupdf.Rect(s["bbox"])
-                    cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
-                    if near.x0 <= cx <= near.x1 and near.y0 <= cy <= near.y1:
-                        if best is None or (r.y0, r.x0) < (best.y0, best.x0):
-                            best = r
-        return best
+            _n, _e, _t, buf = self.doc.extract_font(xref)
+            if not buf:
+                continue
+            key = _clean_font_name(basefont).lower()
+            for k in (key, key.replace(" ", "").replace("-", "")):
+                out.setdefault(k, buf)
+        return out
 
     def set_text(self, idx: int, block: TextBlock, new_text: str,
                  font_choice: str | None = None,
                  font_size: float | None = None,
                  insert_rect: pymupdf.Rect | None = None) -> None:
         page = self.doc[idx]
+        # Буферы шрифтов — до красакта (см. _page_font_buffers).
+        font_buffers = self._page_font_buffers(page)
         # Redaction всегда по исходному прямоугольнику блока.
         page.add_redact_annot(block.rect, fill=False)
         page.apply_redactions(
@@ -183,111 +230,142 @@ class PdfDocument:
         if not new_text:
             return
 
-        size = font_size if font_size else block.size
         target = pymupdf.Rect(insert_rect) if insert_rect is not None else pymupdf.Rect(block.rect)
-        # Глифы стартуют от origin бокса вставки, а плотный bbox из get_text
-        # не оставляет места на межстрочный интервал; после apply_redactions
-        # MuPDF ещё и пересоздаёт ресурс шрифта с большей метрикой — поэтому
-        # запас вправо/вниз, но не влево/вверх (иначе блок "уползает" и
-        # текст уменьшается при каждой правке).
-        box = target + (0, 0, 6, 6)
-        clean = _clean_font_name(block.font)
-        r, g, b = block.color
+        dx, dy = target.x0 - block.rect.x0, target.y0 - block.rect.y0
+        styles = block.line_styles or [
+            {"font": block.font, "size": block.size, "color": block.color,
+             "origin": ()}]
 
-        def htmlbox() -> None:
-            body = _html.escape(new_text, quote=False)
+        def src_style(i: int) -> dict:
+            """Стиль строки i: строка i наследует исходную строку i; новых
+            строк больше — стиль последней исходной строки."""
+            if i < len(styles):
+                s = styles[i]
+            else:
+                s = styles[-1]
+            if not s:
+                s = {"font": block.font, "size": block.size, "color": block.color,
+                     "origin": ()}
+            return s
+
+        lines = new_text.split("\n")  # "\n" пользователя = явный перенос
+
+        # Базовые линии: то же число строк — исходные baseline каждой строки
+        # (x и y строки сохраняются при повторных правках); иначе
+        # последовательная укладка от первой baseline шагом fontsize*1.2.
+        have_orig = (len(lines) == len(styles)
+                     and all(len(s.get("origin", ())) == 2 for s in styles))
+        o0 = styles[0].get("origin", ())
+        if len(o0) == 2:
+            pts = [(o0[0] + dx, o0[1] + dy)]
+        else:
+            # TextBlock без извлечённых origin (создан вручную)
+            pts = [(target.x0, target.y0 + (font_size or block.size))]
+        if not have_orig:
+            for i in range(1, len(lines)):
+                step_size = font_size or src_style(i - 1)["size"]
+                pts.append((pts[0][0], pts[-1][1] + step_size * 1.2))
+        else:
+            pts = [(s["origin"][0] + dx, s["origin"][1] + dy) for s in styles]
+
+        font_memo: dict[str, str | None] = {}
+
+        def emb_ref(font_name: str) -> str | None:
+            """refname встроенного шрифта страницы (вставляется один раз)."""
+            clean = _clean_font_name(font_name)
+            key = clean.lower()
+            if key in _BASE14:
+                return None
+            if key not in font_memo:
+                norm = key.replace(" ", "").replace("-", "")
+                buf = (font_buffers.get(key) or font_buffers.get(norm))
+                if not buf:
+                    # префиксный матч: имя спана короче /BaseFont
+                    for k, b in font_buffers.items():
+                        if k.startswith(norm) or norm.startswith(k):
+                            buf = b
+                            break
+                ref = None
+                if buf:
+                    ref = "EdF" + "".join(ch for ch in clean if ch.isalnum())[:32]
+                    page.insert_font(fontname=ref, fontbuffer=buf)
+                font_memo[key] = ref
+            return font_memo[key]
+
+        def html_line(text: str, size: float, color: tuple, x: float, y: float) -> None:
+            r, g, b = color
+            body = _html.escape(text, quote=False)
             html = (
                 f'<span style="font-size:{size:.1f}pt;'
                 f'color:rgb({r*255:.0f},{g*255:.0f},{b*255:.0f});">{body}</span>'
             )
-
-            def do(bx: pymupdf.Rect) -> None:
-                rc = page.insert_htmlbox(bx, html, scale_low=1.0)
-                # rc[0]<0 = дефицит высоты: расширяем бокс вниз и пробуем
-                # снова; scale_low=0 (беззвучная усадка) — только если
-                # расширенный бокс упёрся в низ страницы.
+            # Story кладёт глифы со своим внутренним отступом от бокса,
+            # зависящим только от size: измеряем его на отдельном документе
+            # (с кэшем) и входим в baseline (x, y) с первого раза. Redact-
+            # перестановка (как раньше) удаляла соседние строки: MuPDF
+            # убирает любой текст, чей bbox пересекает красакт-прямоугольник.
+            ix, iy = _story_inset(size)
+            box = pymupdf.Rect(x - ix, y - iy, page.rect.x1, y - iy + size * 2)
+            rc = page.insert_htmlbox(box, html, scale_low=1.0)
+            # rc[0]<0 = дефицит высоты: расширяем бокс вниз и пробуем снова;
+            # scale_low=0 (беззвучная усадка) — только если упёрлись в низ
+            # страницы.
+            if isinstance(rc, tuple) and rc and rc[0] < 0:
+                box.y1 = min(box.y1 - rc[0] + 2, page.rect.y1)
+                rc = page.insert_htmlbox(box, html, scale_low=1.0)
                 if isinstance(rc, tuple) and rc and rc[0] < 0:
-                    bx = pymupdf.Rect(bx)
-                    bx.y1 = min(bx.y1 - rc[0] + 2, page.rect.y1)
-                    rc = page.insert_htmlbox(bx, html, scale_low=1.0)
-                    if isinstance(rc, tuple) and rc and rc[0] < 0:
-                        page.insert_htmlbox(bx, html, scale_low=0.0)
-
-            do(box)
-            # Story кладёт глифы со своим внутренним отступом (зависит от
-            # шрифта/size, магической константы нет): измеряем и перставляем
-            # со сдвигом, иначе блок "уползает" при каждой правке.
-            bb = self._first_span_bbox(page, box)
-            if bb is not None:
-                dx, dy = target.x0 - bb.x0, target.y0 - bb.y0
-                if abs(dx) > 0.25 or abs(dy) > 0.25:
-                    page.add_redact_annot(bb + (-0.5, -0.5, 0.5, 0.5), fill=False)
-                    page.apply_redactions(
-                        images=pymupdf.PDF_REDACT_IMAGE_NONE,
-                        graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
-                    )
-                    do(pymupdf.Rect(box.x0 + dx, box.y0 + dy, box.x1 + dx, box.y1 + dy))
+                    page.insert_htmlbox(box, html, scale_low=0.0)
 
         # shortcut: redaction применён до вставки; если вставка упадёт, блок
         # уже пуст. Вызывающие (GUI) обязаны сохранить снимок до вызова;
         # библиотечные вызовы без снимка теряют текст при сбое.
-        # Встроенный шрифт оригинального блока (если есть).
-        original_refname = None
-        if clean.lower() not in _BASE14:
-            buf = self._embedded_font_buffer(page, block.font)
-            if buf is not None:
-                original_refname = "EdF" + "".join(ch for ch in clean if ch.isalnum())[:32]
-                page.insert_font(fontname=original_refname, fontbuffer=buf)
-                # shortcut: встроенный субсет может не содержать глифов для
-                # новых символов -> tofu; апгрейд: htmlbox-fallback при обнаружении.
+        # shortcut: одна строка шире страницы переносится htmlbox-ом при
+        # рендере (запрет переноса на ширину страницы дал бы усадку шрифта
+        # целиком); апгрейд: пост-проверка ширины спана.
+        for i, ln in enumerate(lines):
+            if not ln:
+                continue
+            s = src_style(i)
+            x, y = pts[i]
+            size = font_size if font_size else s["size"]
+            color = s["color"]
 
-        # 1. Явно выбранный пользователем шрифт.
-        if font_choice and font_choice not in ("auto", None):
-            if font_choice.startswith("emb:"):
-                name = font_choice[4:]
-                buf = self._embedded_font_buffer(page, name)
-                if buf is not None:
-                    ref = "EdF" + "".join(ch for ch in name if ch.isalnum())[:32]
-                    page.insert_font(fontname=ref, fontbuffer=buf)
-                    if _insert_fit(page, box, new_text, ref, pymupdf.TEXT_ENCODING_LATIN,
-                                   size, block.color):
-                        return
-            else:
-                # Base-14 / CJK. Кириллица/греческий в Base-14 дают '?',
-                # поэтому для не-ascii (кроме CJK) используем htmlbox.
-                if not new_text.isascii() and font_choice not in (
+            def put(font_name: str) -> bool:
+                """Одна строка без переноса; True — вставили insert_text."""
+                ref = emb_ref(font_name)
+                if ref is not None and _insert_text_fit(
+                        page, ref, ln, x, y, size, color):
+                    return True
+                cjk = _cjk_font(ln) if not ln.isascii() else None
+                if cjk is not None:
+                    _insert_text_fit(page, cjk, ln, x, y, size, color)
+                    return True
+                if not ln.isascii():
+                    return False  # кириллица/греческий — htmlbox (unicode)
+                return _insert_text_fit(page, _base14_key(font_name),
+                                        ln, x, y, size, color)
+
+            # Явно выбранный пользователем шрифт — override на весь блок.
+            if font_choice and font_choice not in ("auto",):
+                if font_choice.startswith("emb:"):
+                    ref = emb_ref(font_choice[4:])
+                    if ref is not None and _insert_text_fit(
+                            page, ref, ln, x, y, size, color):
+                        continue
+                elif not ln.isascii() and font_choice not in (
                         "china-s", "china-ss", "japan", "korea"):
-                    htmlbox()
-                    return
-                if not _insert_fit(page, box, new_text, _base14_key(font_choice),
-                                   pymupdf.TEXT_ENCODING_LATIN, size, block.color):
-                    htmlbox()
-                return
-            htmlbox()
-            return
+                    html_line(ln, size, color, x, y)
+                    continue
+                elif _insert_text_fit(page, _base14_key(font_choice),
+                                      ln, x, y, size, color):
+                    continue
+                html_line(ln, size, color, x, y)
+                continue
 
-        # 2. Авто: сохранить исходный встроенный шрифт.
-        if original_refname is not None:
-            if _insert_fit(page, box, new_text, original_refname,
-                        pymupdf.TEXT_ENCODING_LATIN, size, block.color):
-                return
-            # субсет не содержит нужных глифов — пробуем дальше
-
-        # 3. Авто: CJK — reserved name.
-        cjk = _cjk_font(new_text) if not new_text.isascii() else None
-        if cjk is not None:
-            _insert_fit(page, box, new_text, cjk, pymupdf.TEXT_ENCODING_LATIN,
-                        size, block.color)
-            return
-        # Кириллица/греческий без встроенного шрифта — только htmlbox (unicode).
-        if not new_text.isascii():
-            htmlbox()
-            return
-        # ASCII — похожий Base-14; не влезло — htmlbox (сохранит размер).
-        key = _base14_key(block.font)
-        if not _insert_fit(page, box, new_text, key, pymupdf.TEXT_ENCODING_LATIN,
-                           size, block.color):
-            htmlbox()
+            # Авто: строка наследует шрифт исходной строки i.
+            if put(s["font"]):
+                continue
+            html_line(ln, size, color, x, y)
 
     def save_as(self, path: str) -> None:
         if path == self.path:

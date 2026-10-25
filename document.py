@@ -15,13 +15,22 @@ class TextBlock:
     font: str
     size: float
     color: tuple
-    # Стиль по строкам (первый span каждой строки): font, size, color,
-    # origin=(x, y) базовой линии — для сохранения позиций строк при правке.
-    # None = не извлекалось (TextBlock создан вручную).
-    line_styles: list[dict] | None = None
     # Спаны по строкам: [[{font, size, color, origin, text}, ...], ...] —
-    # смешение начертаний внутри строки. None = не извлекалось.
+    # единственный источник стиля (в том числе смешения внутри строки).
+    # None = не извлекалось (TextBlock создан вручную).
     line_runs: list[list[dict]] | None = None
+
+    @property
+    def line_styles(self) -> list[dict]:
+        """Стиль каждой строки — первый спан (вычисляется, не хранится)."""
+        out: list[dict] = []
+        for runs in self.line_runs or []:
+            if runs:
+                out.append({k: runs[0][k] for k in
+                            ("font", "size", "color", "origin")})
+            else:  # пустая строка наследует стиль предыдущей
+                out.append(dict(out[-1]) if out else {})
+        return out
 
 
 def _clean_font_name(name: str) -> str:
@@ -166,7 +175,7 @@ class PdfDocument:
         for b in self.doc[idx].get_text("dict")["blocks"]:
             if b["type"] != 0:
                 continue
-            line_styles, line_runs = [], []
+            line_runs = []
             for line in b["lines"]:
                 runs = []
                 for s in line["spans"]:
@@ -183,25 +192,17 @@ class PdfDocument:
                         "text": s["text"].replace("\xa0", " "),
                     })
                 line_runs.append(runs)
-                if runs:  # стиль строки (совместимость) — первый span
-                    line_styles.append({k: runs[0][k] for k in
-                                        ("font", "size", "color", "origin")})
-                else:
-                    # пустая строка наследует стиль предыдущей
-                    line_styles.append(dict(line_styles[-1]) if line_styles else {})
-            if not line_styles:
-                continue
             text = "\n".join("".join(r["text"] for r in runs)
                              for runs in line_runs)
-            if not text:
+            first = next((r for runs in line_runs for r in runs), None)
+            if not text or first is None:
                 continue
             out.append(TextBlock(
                 rect=pymupdf.Rect(b["bbox"]),
                 text=text,
-                font=line_styles[0]["font"],
-                size=line_styles[0]["size"],
-                color=line_styles[0]["color"],
-                line_styles=line_styles,
+                font=first["font"],
+                size=first["size"],
+                color=first["color"],
                 line_runs=line_runs,
             ))
         return out
@@ -220,17 +221,6 @@ class PdfDocument:
                     seen.add(name)
                     out.append(name)
         return out
-
-    def _embedded_font_buffer(self, page, font_name: str) -> bytes | None:
-        target = _clean_font_name(font_name).lower()
-        for row in page.get_fonts(full=True):
-            xref, ext, _ftype, basefont, _refname, _enc = row[:6]
-            if ext == "n/a" or _clean_font_name(basefont).lower() != target:
-                continue
-            _name, _ext, _type, buf = self.doc.extract_font(xref)
-            if buf:
-                return buf
-        return None
 
     def _page_font_buffers(self, page) -> dict[str, bytes]:
         """Буферы встроенных шрифтов страницы. Снимок ДО redaction:
@@ -455,6 +445,13 @@ class PdfDocument:
 
     def save_as(self, path: str) -> None:
         if path == self.path:
-            self.doc.save(self.path, incremental=True, encryption=pymupdf.PDF_ENCRYPT_KEEP)
+            try:
+                self.doc.save(self.path, incremental=True,
+                              encryption=pymupdf.PDF_ENCRYPT_KEEP)
+            except Exception:
+                # Инкрементальная запись требует исходный файл: после undo
+                # документ открыт из памяти — сохраняем целиком.
+                self.doc.save(path)
         else:
             self.doc.save(path)
+        self.path = path

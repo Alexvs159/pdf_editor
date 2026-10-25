@@ -317,7 +317,7 @@ def test_cyrillic_embedded_stable() -> None:
         doc.save(pdf); doc.close()
         ed = PdfDocument(pdf)
         b = ed.blocks(0)[0]
-        assert ed._embedded_font_buffer(ed.doc[0], b.font) is not None, \
+        assert any(ed._page_font_buffers(ed.doc[0]).values()), \
             "буфер встроенного шрифта не найден"
         out = os.path.join(d, "o.pdf")
         ed.save_as(out)
@@ -568,6 +568,49 @@ def test_htmlbox_long_line_keeps_size() -> None:
         print("test_htmlbox_long_line_keeps_size: ok")
 
 
+def test_save_after_undo() -> None:
+    """После undo документ открыт из памяти: сохранение в тот же файл
+    должно идти полной записью, а не падать на инкрементальной."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf = os.path.join(d, "t.pdf")
+        doc = pymupdf.open()
+        doc.new_page().insert_text((72, 100), "Hello", fontname="helv", fontsize=12)
+        doc.save(pdf)
+        doc.close()
+        ed = PdfDocument(pdf)
+        ed.set_text(0, ed.blocks(0)[0], "Hello world")
+        ed.save_as(pdf)  # инкрементально — обычный путь
+        # undo в GUI переоткрывает документ из памяти
+        data = ed.doc.tobytes()
+        ed.doc.close()
+        ed.doc = pymupdf.open(stream=data, filetype="pdf")
+        ed.save_as(pdf)
+        assert "Hello world" in pymupdf.open(pdf)[0].get_text(), "текст не сохранён"
+        assert ed.path == pdf
+        out = os.path.join(d, "o.pdf")
+        ed.save_as(out)
+        assert ed.path == out and os.path.exists(out), "путь не обновился"
+        print("test_save_after_undo: ok")
+
+
+def test_save_unwritable_raises() -> None:
+    """Сохранение в недоступный путь поднимает ошибку — GUI её перехватывает
+    (иначе исключение в слоте Qt роняет приложение)."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf = os.path.join(d, "t.pdf")
+        doc = pymupdf.open()
+        doc.new_page().insert_text((72, 100), "Hello", fontname="helv", fontsize=12)
+        doc.save(pdf)
+        doc.close()
+        ed = PdfDocument(pdf)
+        try:
+            ed.save_as(os.path.join(d, "no-such-dir", "x.pdf"))
+        except Exception:
+            print("test_save_unwritable_raises: ok")
+        else:
+            raise AssertionError("ошибка не поднялась")
+
+
 if __name__ == "__main__":
     test_blocks()
     test_edit_roundtrip()
@@ -589,5 +632,7 @@ if __name__ == "__main__":
     test_cyrillic_embedded_mixed()
     test_htmlbox_line_mixed_sizes_stable()
     test_htmlbox_long_line_keeps_size()
+    test_save_after_undo()
+    test_save_unwritable_raises()
     print("ALL OK")
     sys.exit(0)

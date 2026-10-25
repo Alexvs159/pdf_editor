@@ -2,7 +2,7 @@
 
 Правка текста — прямо на странице: двойной клик по рамке блока создаёт
 in-place редактор (QGraphicsTextItem). Панель шрифта/размера/Применить
-появляется сверху при выделении блока.
+видна всегда; без выбранного блока её поля отключены.
 """
 import os
 
@@ -67,8 +67,10 @@ class MainWindow(QMainWindow):
         self.blocks = []
         self.selected = -1
         self._undo_stack = []
+        self._dirty = False                            # есть несохранённые правки
         self.overlay: QGraphicsTextItem | None = None  # in-place редактор
         self.overlay_bg = None                         # белая подложка под ним
+        self.overlay_idx = None                        # блок, который правим
         self.edit_rect = None                          # исходный rect блока
 
         self.setWindowTitle("PDF Editor")
@@ -157,6 +159,7 @@ class MainWindow(QMainWindow):
             return
         self.setWindowTitle(f"PDF Editor — {os.path.basename(path)}")
         self._undo_stack.clear()
+        self._dirty = False
         self.thumbs.blockSignals(True)
         self.thumbs.clear()
         for i in range(self.doc.page_count):
@@ -192,9 +195,17 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить как", self.doc.path, "PDF (*.pdf)")
-        if path:
+        if not path:
+            return
+        try:
             self.doc.save_as(path)
-            QMessageBox.information(self, "PDF Editor", f"Сохранено: {path}")
+        except Exception as e:
+            # Без catch исключение в слоте Qt роняет приложение вместе
+            # с несохранёнными правками.
+            QMessageBox.critical(self, "PDF Editor", f"Не удалось сохранить:\n{e}")
+            return
+        self._dirty = False
+        QMessageBox.information(self, "PDF Editor", f"Сохранено: {path}")
 
     def set_block_controls_enabled(self, on: bool) -> None:
         """Параметры шрифта и Применить/Отмена — только при выбранном блоке."""
@@ -211,6 +222,7 @@ class MainWindow(QMainWindow):
         self.scene.clear()
         self.overlay = None
         self.overlay_bg = None
+        self.overlay_idx = None
         self.info.setText("Блок не выбран")
         self.set_block_controls_enabled(False)
         pix = self.doc.page_pixmap(self.page_idx, zoom=VIEW_ZOOM)
@@ -253,7 +265,8 @@ class MainWindow(QMainWindow):
             return
         self.cancel_edit()
         item.setSelected(True)
-        b = self.blocks[item.data(0)]
+        self.overlay_idx = item.data(0)
+        b = self.blocks[self.overlay_idx]
         rect = item.sceneBoundingRect()
         self.edit_rect = rect
         self.overlay_bg = self.scene.addRect(
@@ -306,21 +319,30 @@ class MainWindow(QMainWindow):
                             (sr.x() + sr.width()) / VIEW_ZOOM,
                             (sr.y() + sr.height()) / VIEW_ZOOM)
 
+    def _snapshot(self) -> None:
+        """Снимок документа для undo: не больше 20 шагов и 64 МБ."""
+        self._undo_stack.append(self.doc.doc.tobytes())
+        total = sum(len(d) for d in self._undo_stack)
+
+        while len(self._undo_stack) > 1 and (
+                len(self._undo_stack) > 20 or total > 64 * 1024 * 1024):
+            total -= len(self._undo_stack.pop(0))
+
     def _submit(self, b, text: str, target: pymupdf.Rect | None,
                 choice: str | None = None, font_size: float | None = None) -> None:
         """Общая точка применения: undo-снимок, правка модели, перерисовка."""
-        self._undo_stack.append(self.doc.doc.tobytes())
-        if len(self._undo_stack) > 20:
-            self._undo_stack.pop(0)
+        self._snapshot()
         try:
             self.doc.set_text(self.page_idx, b, text, font_choice=choice,
                               font_size=font_size, insert_rect=target)
         except Exception as e:
             QMessageBox.critical(self, "PDF Editor", f"Ошибка редактирования:\n{e}")
             return
+        self._dirty = True
         # Оверлей больше не нужен: снимок уже в undo, страницу перерисуем.
         self.overlay = None
         self.overlay_bg = None
+        self.overlay_idx = None
         self.select_page(self.page_idx)
         item = self.thumbs.currentItem()
         if item is not None:
@@ -330,22 +352,36 @@ class MainWindow(QMainWindow):
         self.info.setText("Изменено (Ctrl+Z — отменить)")
 
     def apply_edit(self) -> None:
-        if not self.doc or self.overlay is None or self.selected < 0:
+        """Применить текст из редактора и/или шрифт с размером к блоку."""
+        if not self.doc:
             return
+        idx = self.overlay_idx if self.overlay_idx is not None else self.selected
+        if idx is None or not 0 <= idx < len(self.blocks):
+            return
+        b = self.blocks[idx]
         target = None
         for it in self.scene.items():
-            if isinstance(it, BlockItem) and it.data(0) == self.selected:
+            if isinstance(it, BlockItem) and it.data(0) == idx:
                 target = self.scene_rect(it)
                 break
-        self._submit(self.blocks[self.selected], self._overlay_text(), target,
-                     self.font_combo.currentData(),
+        text = self._overlay_text() if self.overlay is not None else b.text
+        self._submit(b, text, target, self.font_combo.currentData(),
                      None if self.size_auto.isChecked() else self.size_spin.value())
 
     def commit_move(self, idx: int, target: pymupdf.Rect) -> None:
         """Перемещение мышью: фиксируется сразу, текст встаёт на новое место."""
         if not self.doc or idx < 0 or idx >= len(self.blocks):
             return
-        self.cancel_edit()  # открытая правка отменяется, как при клике мимо
+        old = self.blocks[idx]
+        if self.overlay is not None:
+            # Набранный текст не выбрасываем: применяем его до перемещения,
+            # затем ищем сдвинутый блок заново (страница перерисована).
+            self.apply_edit()
+            idx = next((i for i, b in enumerate(self.blocks)
+                        if abs(b.rect.x0 - old.rect.x0) < 1
+                        and abs(b.rect.y0 - old.rect.y0) < 1), None)
+            if idx is None:
+                return
         self._submit(self.blocks[idx], self.blocks[idx].text, target)
 
     def undo(self) -> None:
@@ -358,6 +394,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "PDF Editor", f"Не удалось отменить:\n{e}")
             return
+        self._dirty = True
         self.select_page(self.page_idx)
         self.thumbs.blockSignals(True)
         for i in range(self.doc.page_count):
@@ -368,7 +405,7 @@ class MainWindow(QMainWindow):
         self.info.setText("Отменено (Ctrl+Z)")
 
     def closeEvent(self, event):
-        if self._undo_stack:
+        if self._dirty:
             reply = QMessageBox.question(
                 self, "PDF Editor", "Есть несохранённые правки. Закрыть без сохранения?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

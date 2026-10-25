@@ -1,15 +1,37 @@
 """GUI-смоки правки на канве. Запуск: QT_QPA_PLATFORM=offscreen .venv/bin/python test_gui_edit.py"""
 import os
 import sys
+import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+
+import pymupdf
 
 app = QApplication(sys.argv)
 
 from window import BlockItem, MainWindow
 
-WIN = MainWindow(pdf_path="Счет.pdf")
+# Пример PDF создаём сами: в репозитории нет тестовых файлов (*.pdf в gitignore).
+SAMPLE = os.path.join(tempfile.mkdtemp(), "sample.pdf")
+_doc = pymupdf.open()
+_page = _doc.new_page()
+_page.insert_textbox(pymupdf.Rect(72, 72, 400, 120), "Hello world test",
+                     fontname="helv", fontsize=12)
+_page.insert_htmlbox(
+    pymupdf.Rect(72, 200, 400, 260),
+    '<span style="font-size:12pt"><b>Bold start</b> regular tail here</span>')
+_page.insert_textbox(pymupdf.Rect(72, 320, 400, 380), "Second block for move",
+                     fontname="helv", fontsize=12)
+_doc.save(SAMPLE)
+_doc.close()
+
+
+def is_bold(name: str) -> bool:
+    return "bold" in name.lower()
+
+
+WIN = MainWindow(pdf_path=SAMPLE)
 WIN.resize(1280, 860)
 WIN.show()
 
@@ -27,10 +49,6 @@ def find_block(substr):
         if isinstance(it, BlockItem) and substr in WIN.blocks[it.data(0)].text:
             return it
     return None
-
-
-def blocks_by_text(substr):
-    return {i: b for i, b in enumerate(WIN.blocks) if substr in b.text}
 
 
 def item_text(item: BlockItem) -> str:
@@ -169,13 +187,13 @@ w1, h1 = ov.boundingRect().width(), ov.boundingRect().height()
 ov.setPlainText(ov.toPlainText().split("\n")[0] + " " + "LONGER TEXT " * 6)
 w2, h2 = ov.boundingRect().width(), ov.boundingRect().height()
 check("8. оверлей вырос по ширине", w2 > w1 * 1.4)
-check("8. переноса нет (одна строка)", h2 < h1)
+check("8. переноса нет (высота не выросла)", h2 <= h1 + 0.5)
 check("8. подложка закрывает текст", WIN.overlay_bg.rect().width() >= w2 - 1)
 WIN.cancel_edit()
 check("8. отмена убирает оверлей", WIN.overlay is None)
 
 # --- 9. блок со смешанными начертаниями не становится целиком жирным
-mixed = next(i for i, b in enumerate(WIN.blocks) if b.text.startswith("Поставщик:"))
+mixed = next(i for i, b in enumerate(WIN.blocks) if b.text.startswith("Bold start"))
 item = next(it for it in WIN.scene.items() if isinstance(it, BlockItem) and it.data(0) == mixed)
 item.setSelected(True)
 WIN.on_block_selected()
@@ -183,19 +201,20 @@ check("9. шрифт = Авто (нет override на весь блок)",
       WIN.font_combo.currentData() == "auto")
 WIN.start_edit(item)
 WIN.overlay.setPlainText(
-    WIN.overlay.toPlainText().replace("Владивостока", "Владивостока (Приморье)"))
+    WIN.overlay.toPlainText().replace("regular", "regular (kept)"))
 WIN.apply_edit()
-b9 = next(x for x in WIN.blocks if x.text.startswith("Поставщик:"))
-check("9. начертания строк сохранены",
-      [r["font"] for runs in b9.line_runs for r in runs]
-      == ["Tahoma-Bold", "Tahoma", "Tahoma"])
-check("9. размеры строк сохранены",
-      [round(ls["size"], 1) for ls in b9.line_styles] == [10.0, 9.0, 9.0])
+b9 = next(x for x in WIN.blocks if x.text.startswith("Bold start"))
+runs9 = [r for line in b9.line_runs for r in line]
+check("9. начертания сохранены",
+      len(runs9) >= 2 and is_bold(runs9[0]["font"])
+      and not is_bold(runs9[1]["font"]))
+check("9. размеры сохранены",
+      all(abs(r["size"] - 12.0) < 0.6 for r in runs9))
 
 # --- 10. перемещение мышью фиксируется сразу, текст едет вместе с рамкой
-WIN.open_pdf("Счет.pdf")  # чистый документ: порядок блоков стабилен
+WIN.open_pdf(SAMPLE)  # чистый документ: порядок блоков стабилен
 WIN.thumbs.setCurrentRow(0)
-marker = "В отсутствии"
+marker = "Second block for move"
 idx = next(i for i, b in enumerate(WIN.blocks) if b.text.startswith(marker))
 old = WIN.blocks[idx].rect
 item = next(it for it in WIN.scene.items()
@@ -208,13 +227,43 @@ check("10. перемещение применено без кнопки",
       and abs(moved[0].rect.y0 - old.y0) > 3)
 check("10. текст на новом месте",
       any(abs(wd[0] - moved[0].rect.x0) < 3
-          for wd in WIN.doc.doc[0].get_text("words") if wd[4] == "В"))
-check("10. начертания сохранены",
-      [r["font"] for runs in moved[0].line_runs for r in runs][0] == "Tahoma")
+          for wd in WIN.doc.doc[0].get_text("words") if wd[4] == "Second"))
+check("10. шрифт сохранён",
+      not is_bold([r["font"] for runs in moved[0].line_runs for r in runs][0]))
 WIN.undo()
 WIN.select_page(0)
 back = [b for b in WIN.blocks if b.text.startswith(marker)][0]
 check("10. undo возвращает позицию", abs(back.rect.x0 - old.x0) < 1)
+
+# --- 11. сбой сохранения перехвачен; успешное снимает флаг «грязный»
+errors = []
+_saved_info = QMessageBox.information
+QMessageBox.critical = staticmethod(lambda *a, **k: errors.append(a[2] if len(a) > 2 else ""))
+QMessageBox.information = staticmethod(lambda *a, **k: None)
+QFileDialog.getSaveFileName = staticmethod(
+    lambda *a, **k: ("/nonexistent-xyz/x.pdf", ""))
+WIN.prompt_save()
+check("11. сбой сохранения перехвачен (приложение живо)", bool(errors))
+saved = os.path.join(os.path.dirname(SAMPLE), "saved.pdf")
+QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (saved, ""))
+WIN.prompt_save()
+check("11. файл сохранён", os.path.exists(saved))
+check("11. флаг «грязный» снят", WIN._dirty is False)
+
+# --- 12. «Применить» без редактора меняет параметры выбранного блока
+idx = next(i for i, b in enumerate(WIN.blocks) if b.text.startswith("Second block"))
+item = next(it for it in WIN.scene.items()
+            if isinstance(it, BlockItem) and it.data(0) == idx)
+item.setSelected(True)
+WIN.on_block_selected()
+WIN.size_auto.setChecked(False)
+WIN.size_spin.setValue(20.0)
+WIN.apply_edit()
+b12 = next(x for x in WIN.blocks if x.text.startswith("Second block"))
+sizes12 = [round(r["size"], 1) for line in b12.line_runs for r in line]
+check("12. размер применён без редактора", sizes12 and all(s == 20.0 for s in sizes12))
+check("12. правка помечена как несохранённая", WIN._dirty is True)
+QMessageBox.information = _saved_info
 
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)

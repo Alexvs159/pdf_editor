@@ -7,8 +7,7 @@ from window import MainWindow
 
 def main() -> None:
     app = QApplication(sys.argv)
-    args = [a for a in sys.argv[1:]]
-    path = args[0] if args else None
+    path = sys.argv[1] if len(sys.argv) > 1 else None
     if not path:
         path, _ = QFileDialog.getOpenFileName(None, "Открыть PDF", "", "PDF (*.pdf)")
     if path:

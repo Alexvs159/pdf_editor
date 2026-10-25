@@ -3,6 +3,8 @@ import os
 import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 app = QApplication(sys.argv)
@@ -183,6 +185,36 @@ check("9. начертания строк сохранены",
       == ["Tahoma-Bold", "Tahoma", "Tahoma"])
 check("9. размеры строк сохранены",
       [round(ls["size"], 1) for ls in b9.line_styles] == [10.0, 9.0, 9.0])
+
+# --- 10. перемещение мышью фиксируется сразу, текст едет вместе с рамкой
+idx = next(i for i, b in enumerate(WIN.blocks) if b.text.startswith("Поставщик:"))
+old = WIN.blocks[idx].rect
+item = next(it for it in WIN.scene.items()
+            if isinstance(it, BlockItem) and it.data(0) == idx)
+# рамки блоков перекрываются — берём точку, где сверху именно нужная рамка
+r = item.sceneBoundingRect()
+pts = [r.topLeft() + QPointF(5, 5), r.topRight() + QPointF(-5, 5),
+       r.bottomLeft() + QPointF(5, -5), r.center()]
+vp = WIN.view.viewport()
+start = next(p for p in (WIN.view.mapFromScene(q) for q in pts)
+             if WIN.view.itemAt(p) is item)
+end = start + QPoint(60, 40)
+QTest.mousePress(vp, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start)
+QTest.mouseMove(vp, end, 10)
+QTest.mouseRelease(vp, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, end)
+app.processEvents()
+b10 = next(b for b in WIN.blocks if b.text.startswith("Поставщик:"))
+check("10. перемещение применено без кнопки",
+      abs(b10.rect.x0 - old.x0) > 3 and abs(b10.rect.y0 - old.y0) > 3)
+check("10. текст на новом месте",
+      any(abs(wd[0] - b10.rect.x0) < 3
+          for wd in WIN.doc.doc[0].get_text("words") if wd[4] == "Поставщик:"))
+check("10. начертания сохранены",
+      [r["font"] for runs in b10.line_runs for r in runs][0] == "Tahoma-Bold")
+WIN.undo()
+WIN.select_page(0)
+b10u = next(b for b in WIN.blocks if b.text.startswith("Поставщик:"))
+check("10. undo возвращает позицию", abs(b10u.rect.x0 - old.x0) < 1)
 
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)

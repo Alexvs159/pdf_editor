@@ -6,7 +6,7 @@ in-place редактор (QGraphicsTextItem). Панель шрифта/раз�
 """
 import os
 
-from PyQt6.QtCore import QRectF, QSize, Qt
+from PyQt6.QtCore import QRectF, QSize, Qt, QTimer
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPen, QPixmap, QShortcut,
 )
@@ -36,9 +36,27 @@ class BlockItem(QGraphicsRectItem):
     def __init__(self, rect: QRectF, win: "MainWindow"):
         super().__init__(rect)
         self.win = win
+        self._press = None
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.win.start_edit(self)
+
+    def mousePressEvent(self, event) -> None:
+        self._press = self.pos()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        p, self._press = self._press, None
+        if p is None:
+            return
+        if abs(self.pos().x() - p.x()) + abs(self.pos().y() - p.y()) < 1:
+            return  # клик, а не перемещение
+        # Перемещение фиксируется сразу, без кнопки «Применить». Позицию
+        # считаем сейчас: отложенный вызов пересоздаст сцену и этот item.
+        idx = self.data(0)
+        rect = self.win.scene_rect(self)
+        QTimer.singleShot(0, lambda: self.win.commit_move(idx, rect))
 
 
 class MainWindow(QMainWindow):
@@ -270,25 +288,19 @@ class MainWindow(QMainWindow):
         if t is not None:
             self.scene.removeItem(t)
 
-    def apply_edit(self) -> None:
-        if not self.doc or self.overlay is None or self.selected < 0:
-            return
-        text = self._overlay_text()
-        b = self.blocks[self.selected]
+    def scene_rect(self, item: BlockItem) -> pymupdf.Rect:
+        """Rect рамки в координатах PDF (сцена масштабирована VIEW_ZOOM)."""
+        sr = item.sceneBoundingRect()
+        return pymupdf.Rect(sr.x() / VIEW_ZOOM, sr.y() / VIEW_ZOOM,
+                            (sr.x() + sr.width()) / VIEW_ZOOM,
+                            (sr.y() + sr.height()) / VIEW_ZOOM)
+
+    def _submit(self, b, text: str, target: pymupdf.Rect | None,
+                choice: str | None = None, font_size: float | None = None) -> None:
+        """Общая точка применения: undo-снимок, правка модели, перерисовка."""
         self._undo_stack.append(self.doc.doc.tobytes())
         if len(self._undo_stack) > 20:
             self._undo_stack.pop(0)
-        choice = self.font_combo.currentData()
-        font_size = None if self.size_auto.isChecked() else self.size_spin.value()
-        # Если блок перемещали мышью — вставляем в новое место.
-        target = None
-        for it in self.scene.items():
-            if isinstance(it, BlockItem) and it.data(0) == self.selected:
-                sr = it.sceneBoundingRect()
-                target = pymupdf.Rect(sr.x() / VIEW_ZOOM, sr.y() / VIEW_ZOOM,
-                                      (sr.x() + sr.width()) / VIEW_ZOOM,
-                                      (sr.y() + sr.height()) / VIEW_ZOOM)
-                break
         try:
             self.doc.set_text(self.page_idx, b, text, font_choice=choice,
                               font_size=font_size, insert_rect=target)
@@ -305,6 +317,25 @@ class MainWindow(QMainWindow):
                 QIcon(QPixmap.fromImage(pixmap_to_qimage(self.doc.thumbnail_pixmap(self.page_idx))))
             )
         self.info.setText("Изменено (Ctrl+Z — отменить)")
+
+    def apply_edit(self) -> None:
+        if not self.doc or self.overlay is None or self.selected < 0:
+            return
+        target = None
+        for it in self.scene.items():
+            if isinstance(it, BlockItem) and it.data(0) == self.selected:
+                target = self.scene_rect(it)
+                break
+        self._submit(self.blocks[self.selected], self._overlay_text(), target,
+                     self.font_combo.currentData(),
+                     None if self.size_auto.isChecked() else self.size_spin.value())
+
+    def commit_move(self, idx: int, target: pymupdf.Rect) -> None:
+        """Перемещение мышью: фиксируется сразу, текст встаёт на новое место."""
+        if not self.doc or idx < 0 or idx >= len(self.blocks):
+            return
+        self.cancel_edit()  # открытая правка отменяется, как при клике мимо
+        self._submit(self.blocks[idx], self.blocks[idx].text, target)
 
     def undo(self) -> None:
         if not self.doc or not self._undo_stack:

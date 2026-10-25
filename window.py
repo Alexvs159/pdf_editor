@@ -212,13 +212,10 @@ class MainWindow(QMainWindow):
         self.info.setText(f"Шрифт: {b.font} · {b.size:g} pt (двойной клик — правка)")
         self.size_spin.setValue(b.size)
         self.size_auto.setChecked(True)
-        clean = _clean_font_name(b.font)
-        i = self.font_combo.findData(f"emb:{clean}")
-        if i < 0:
-            i = self.font_combo.findData(_base14_key(b.font))
-        if i < 0:
-            i = self.font_combo.findData("auto")
-        self.font_combo.setCurrentIndex(i if i >= 0 else 0)
+        # «Авто»: шрифт каждого прогона берётся из модели. Выставлять здесь
+        # шрифт первого спана нельзя — это override на весь блок, и блок со
+        # смешанными начертаниями становился целиком жирным.
+        self.font_combo.setCurrentIndex(0)
         self.top.show()
 
     # -- правка in-place --------------------------------------------------

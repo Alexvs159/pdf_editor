@@ -166,6 +166,24 @@ check("8. подложка закрывает текст", WIN.overlay_bg.rect()
 WIN.cancel_edit()
 check("8. отмена убирает оверлей", WIN.overlay is None)
 
+# --- 9. блок со смешанными начертаниями не становится целиком жирным
+mixed = next(i for i, b in enumerate(WIN.blocks) if b.text.startswith("Поставщик:"))
+item = next(it for it in WIN.scene.items() if isinstance(it, BlockItem) and it.data(0) == mixed)
+item.setSelected(True)
+WIN.on_block_selected()
+check("9. шрифт = Авто (нет override на весь блок)",
+      WIN.font_combo.currentData() == "auto")
+WIN.start_edit(item)
+WIN.overlay.setPlainText(
+    WIN.overlay.toPlainText().replace("Владивостока", "Владивостока (Приморье)"))
+WIN.apply_edit()
+b9 = next(x for x in WIN.blocks if x.text.startswith("Поставщик:"))
+check("9. начертания строк сохранены",
+      [r["font"] for runs in b9.line_runs for r in runs]
+      == ["Tahoma-Bold", "Tahoma", "Tahoma"])
+check("9. размеры строк сохранены",
+      [round(ls["size"], 1) for ls in b9.line_styles] == [10.0, 9.0, 9.0])
+
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 WIN.close()  # closeEvent покажет подтверждение несохранённых правок

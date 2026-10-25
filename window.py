@@ -100,20 +100,22 @@ class MainWindow(QMainWindow):
         self.size_auto = QCheckBox("Авто")
         self.size_auto.setChecked(True)
         self.size_auto.setToolTip("Размер по строкам исходного блока")
-        apply_btn = QPushButton("Применить (Ctrl+Enter)")
-        apply_btn.clicked.connect(self.apply_edit)
-        cancel_btn = QPushButton("Отмена (Esc)")
-        cancel_btn.clicked.connect(self.cancel_edit)
+        self.apply_btn = QPushButton("Применить (Ctrl+Enter)")
+        self.apply_btn.clicked.connect(self.apply_edit)
+        self.cancel_btn = QPushButton("Отмена (Esc)")
+        self.cancel_btn.clicked.connect(self.cancel_edit)
         undo_btn = QPushButton("Отменить (Ctrl+Z)")
         undo_btn.clicked.connect(self.undo)
         top_row.addWidget(self.info, 1)
         top_row.addWidget(self.font_combo)
         top_row.addWidget(self.size_auto)
         top_row.addWidget(self.size_spin)
-        top_row.addWidget(apply_btn)
-        top_row.addWidget(cancel_btn)
+        top_row.addWidget(self.apply_btn)
+        top_row.addWidget(self.cancel_btn)
         top_row.addWidget(undo_btn)
-        self.top.hide()
+        # Панель видна всегда: иначе при выборе блока страница прыгает вниз
+        # на её высоту. Без выбора блока параметры недоступны.
+        self.set_block_controls_enabled(False)
 
         central = QWidget()
         lay = QVBoxLayout(central)
@@ -194,6 +196,12 @@ class MainWindow(QMainWindow):
             self.doc.save_as(path)
             QMessageBox.information(self, "PDF Editor", f"Сохранено: {path}")
 
+    def set_block_controls_enabled(self, on: bool) -> None:
+        """Параметры шрифта и Применить/Отмена — только при выбранном блоке."""
+        for w in (self.font_combo, self.size_auto, self.size_spin,
+                  self.apply_btn, self.cancel_btn):
+            w.setEnabled(on)
+
     # -- страницы и блоки -------------------------------------------------
     def select_page(self, row: int) -> None:
         if not self.doc or row < 0:
@@ -203,6 +211,8 @@ class MainWindow(QMainWindow):
         self.scene.clear()
         self.overlay = None
         self.overlay_bg = None
+        self.info.setText("Блок не выбран")
+        self.set_block_controls_enabled(False)
         pix = self.doc.page_pixmap(self.page_idx, zoom=VIEW_ZOOM)
         self.scene.addPixmap(QPixmap.fromImage(pixmap_to_qimage(pix)))
         self.blocks = self.doc.blocks(self.page_idx)
@@ -223,7 +233,8 @@ class MainWindow(QMainWindow):
             if self.overlay is not None:
                 # Клик мимо блоков при открытом редакторе — выход без правки.
                 self.cancel_edit()
-            self.top.hide()
+            self.info.setText("Блок не выбран")
+            self.set_block_controls_enabled(False)
             return
         b = self.blocks[items[0].data(0)]
         self.selected = items[0].data(0)
@@ -234,7 +245,7 @@ class MainWindow(QMainWindow):
         # шрифт первого спана нельзя — это override на весь блок, и блок со
         # смешанными начертаниями становился целиком жирным.
         self.font_combo.setCurrentIndex(0)
-        self.top.show()
+        self.set_block_controls_enabled(True)
 
     # -- правка in-place --------------------------------------------------
     def start_edit(self, item: BlockItem) -> None:

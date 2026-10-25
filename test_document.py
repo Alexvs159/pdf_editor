@@ -113,11 +113,65 @@ def test_no_shrink_and_move() -> None:
         print("test_no_shrink_and_move: ok")
 
 
+def test_no_shrink_big_size() -> None:
+    """Правка тем же текстом при 24pt+ не уменьшает размер: дефицит высоты
+    плотного bbox закрывается расширением бокса вниз, не усадкой шрифта."""
+    for size in (24.0, 36.0):
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "t.pdf")
+            doc = pymupdf.open()
+            page = doc.new_page()
+            page.insert_textbox(pymupdf.Rect(72, 72, 400, 300),
+                                "Big roundtrip size " * 3,
+                                fontname="helv", fontsize=size)
+            doc.save(pdf)
+            doc.close()
+            for _ in range(3):
+                ed = PdfDocument(pdf)
+                b = ed.blocks(0)[0]
+                ed.set_text(0, b, b.text)
+                out = os.path.join(d, "o.pdf")
+                ed.save_as(out)
+                pdf = out
+            chk = pymupdf.open(pdf)
+            span = [s for blk in chk[0].get_text("dict")["blocks"] if blk["type"] == 0
+                    for l in blk["lines"] for s in l["spans"]][0]
+            assert abs(span["size"] - size) < 0.5, f"размер уменьшился: {span['size']}"
+
+def test_longer_text_keeps_size() -> None:
+    """Правка более длинным текстом сохраняет размер шрифта — текст
+    может выходить ниже исходного блока за счёт расширения бокса."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf = os.path.join(d, "t.pdf")
+        out = os.path.join(d, "o.pdf")
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 72, 300, 200), "short line",
+                            fontname="helv", fontsize=18)
+        doc.save(pdf)
+        doc.close()
+        ed = PdfDocument(pdf)
+        b = ed.blocks(0)[0]
+        long_text = "a much longer replacement line " * 6
+        ed.set_text(0, b, long_text)
+        ed.save_as(out)
+        chk = pymupdf.open(out)
+        text = chk[0].get_text()
+        assert "longer" in text, "нового текста нет"
+        spans = [s for blk in chk[0].get_text("dict")["blocks"] if blk["type"] == 0
+                 for l in blk["lines"] for s in l["spans"]]
+        sizes = {s["size"] for s in spans}
+        assert len(sizes) == 1 and abs(sizes.pop() - 18.0) < 0.5, \
+            f"размер изменился: {sizes}"
+
+
 if __name__ == "__main__":
     test_blocks()
     test_edit_roundtrip()
     test_save_same_file()
     test_base14_mapping()
     test_no_shrink_and_move()
+    test_no_shrink_big_size()
+    test_longer_text_keeps_size()
     print("ALL OK")
     sys.exit(0)

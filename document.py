@@ -67,13 +67,24 @@ def _cjk_font(text: str) -> str | None:
 
 
 def _insert_fit(page, rect, text, fontname, encoding, start_size, color) -> bool:
-    """Вставить текст, уменьшая шрифт до 4pt. Ничего не вставляет, если
-    не влезло даже так (вызывающий решает fallback); True, если влезло."""
+    """Вставить текст. rc<0 у insert_textbox = дефицит высоты в пунктах:
+    расширяем бокс вниз на недостающее (глифы идут от origin, поэтому
+    позиция первой строки не меняется). Шрифт уменьшаем только когда
+    расширенный бокс выходит за страницу. Ничего не вставляет, если не
+    влезло даже так (вызывающий решает fallback); True, если влезло."""
     s = start_size
+    page_y1 = page.rect.y1
     while s >= 4:
-        if page.insert_textbox(rect, text, fontname=fontname, encoding=encoding,
-                             fontsize=s, color=color,
-                             align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
+        rc = page.insert_textbox(rect, text, fontname=fontname, encoding=encoding,
+                                 fontsize=s, color=color,
+                                 align=pymupdf.TEXT_ALIGN_LEFT)
+        if rc >= 0:
+            return True
+        bigger = pymupdf.Rect(rect)
+        bigger.y1 = min(bigger.y1 - rc + 2, page_y1)
+        if page.insert_textbox(bigger, text, fontname=fontname, encoding=encoding,
+                               fontsize=s, color=color,
+                               align=pymupdf.TEXT_ALIGN_LEFT) >= 0:
             return True
         s -= 0.5
     return False
@@ -192,8 +203,15 @@ class PdfDocument:
 
             def do(bx: pymupdf.Rect) -> None:
                 rc = page.insert_htmlbox(bx, html, scale_low=1.0)
+                # rc[0]<0 = дефицит высоты: расширяем бокс вниз и пробуем
+                # снова; scale_low=0 (беззвучная усадка) — только если
+                # расширенный бокс упёрся в низ страницы.
                 if isinstance(rc, tuple) and rc and rc[0] < 0:
-                    page.insert_htmlbox(bx, html, scale_low=0.0)
+                    bx = pymupdf.Rect(bx)
+                    bx.y1 = min(bx.y1 - rc[0] + 2, page.rect.y1)
+                    rc = page.insert_htmlbox(bx, html, scale_low=1.0)
+                    if isinstance(rc, tuple) and rc and rc[0] < 0:
+                        page.insert_htmlbox(bx, html, scale_low=0.0)
 
             do(box)
             # Story кладёт глифы со своим внутренним отступом (зависит от

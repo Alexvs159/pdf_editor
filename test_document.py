@@ -22,6 +22,23 @@ def make_pdf(path: str) -> None:
     doc.close()
 
 
+def _html_pdf(path: str, html: str) -> None:
+    doc = pymupdf.open()
+    doc.new_page().insert_htmlbox(pymupdf.Rect(72, 80, 470, 150), html)
+    doc.save(path)
+    doc.close()
+
+
+def _spans(path: str) -> list[tuple]:
+    """Спаны первой страницы: (font, size, x, y, text)."""
+    doc = pymupdf.open(path)
+    out = [(s["font"], s["size"], s["origin"][0], s["origin"][1], s["text"])
+           for b in doc[0].get_text("dict")["blocks"] if b["type"] == 0
+           for line in b["lines"] for s in line["spans"]]
+    doc.close()
+    return out
+
+
 def test_blocks() -> None:
     with tempfile.TemporaryDirectory() as d:
         pdf = os.path.join(d, "t.pdf")
@@ -352,6 +369,185 @@ def test_cyrillic_htmlbox_stable() -> None:
         print("test_cyrillic_htmlbox_stable: ok")
 
 
+MIXED = ('<span style="font-size:12pt"><b>Bold start</b> '
+         'regular tail here</span>')
+
+
+def test_mixed_weight_roundtrip() -> None:
+    """Жирное начало + обычный хвост: правка тем же текстом сохраняет ДВА
+    спана с исходными шрифтами/размерами/x (было: весь текст жирнел)."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        _html_pdf(pdf, MIXED)
+        before = _spans(pdf)
+        assert len(before) == 2 and "Bold" in before[0][0] \
+            and "Bold" not in before[1][0], before
+        ed = PdfDocument(pdf)
+        b = ed.blocks(0)[0]
+        assert len(b.line_runs[0]) == 2, f"спанов строки: {b.line_runs[0]}"
+        assert b.line_runs[0][1]["text"] == " regular tail here"
+        src = pdf
+        for _ in range(2):  # повторные правки тем же текстом
+            ed = PdfDocument(src)
+            b = ed.blocks(0)[0]
+            ed.set_text(0, b, b.text)
+            ed.save_as(out)
+            src = out
+        after = _spans(out)
+        assert len(after) == 2, after
+        for a, c in zip(before, after):
+            assert a[0] == c[0], f"шрифт: {a[0]} != {c[0]}"
+            assert abs(a[1] - c[1]) < 0.01 and a[4] == c[4], (a, c)
+            assert abs(a[2] - c[2]) < 0.01 and abs(a[3] - c[3]) < 0.01, \
+                f"позиция: {(a[2], a[3])} != {(c[2], c[3])}"
+        print("test_mixed_weight_roundtrip: ok")
+
+
+def test_mixed_weight_insert_regular() -> None:
+    """Вставка в НЕжирную часть: новые символы обычные, жирное начало
+    остаётся жирным."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        _html_pdf(pdf, MIXED)
+        ed = PdfDocument(pdf)
+        ed.set_text(0, ed.blocks(0)[0], "Bold start regXYZular tail here")
+        ed.save_as(out)
+        sp = _spans(out)
+        assert "".join(s[4] for s in sp) == "Bold start regXYZular tail here", sp
+        assert len(sp) == 2, sp
+        assert "Bold" in sp[0][0] and sp[0][4] == "Bold start", sp
+        assert "Bold" not in sp[1][0] and "regXYZ" in sp[1][4], sp
+        print("test_mixed_weight_insert_regular: ok")
+
+
+def test_mixed_weight_replace_bold() -> None:
+    """Замена текста внутри жирной части остаётся жирной."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        _html_pdf(pdf, MIXED)
+        ed = PdfDocument(pdf)
+        ed.set_text(0, ed.blocks(0)[0], "Bold ZZ regular tail here")
+        ed.save_as(out)
+        sp = _spans(out)
+        assert sp[0][4] == "Bold ZZ" and "Bold" in sp[0][0], sp
+        assert "Bold" not in sp[1][0] and "regular tail here" in sp[1][4], sp
+        print("test_mixed_weight_replace_bold: ok")
+
+
+def test_mixed_weight_append() -> None:
+    """Добавление в конец строки наследует стиль последнего run, а не
+    первого."""
+    html = ('<span style="font-size:12pt"><b>Bold</b> regular '
+            '<b>bold tail</b></span>')
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        _html_pdf(pdf, html)
+        ed = PdfDocument(pdf)
+        b = ed.blocks(0)[0]
+        assert [len(lr) for lr in b.line_runs] == [3], b.line_runs
+        ed.set_text(0, b, b.text + " MORE")
+        ed.save_as(out)
+        sp = _spans(out)
+        assert sp[-1][4].endswith("MORE"), sp
+        assert "Bold" in sp[-1][0], f"хвост не жирный: {sp}"
+        assert "Bold" not in sp[1][0], sp
+        print("test_mixed_weight_append: ok")
+
+
+def test_mixed_sizes_roundtrip() -> None:
+    """Три разных размера в одной строке: правка тем же текстом сохраняет
+    размер и x каждого спана."""
+    html = ('<span style="font-size:10pt">ten</span>'
+            '<span style="font-size:16pt">SIXTEEN</span>'
+            '<span style="font-size:10pt">ten</span>')
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        _html_pdf(pdf, html)
+        before = _spans(pdf)
+        assert [round(s[1]) for s in before] == [10, 16, 10], before
+        ed = PdfDocument(pdf)
+        b = ed.blocks(0)[0]
+        ed.set_text(0, b, b.text)
+        ed.save_as(out)
+        after = _spans(out)
+        assert len(after) == 3, after
+        for a, c in zip(before, after):
+            assert abs(a[1] - c[1]) < 0.01 and a[4] == c[4], (a, c)
+            assert abs(a[2] - c[2]) < 0.01, f"x: {a[2]} != {c[2]}"
+        print("test_mixed_sizes_roundtrip: ok")
+
+
+def test_cyrillic_embedded_mixed() -> None:
+    """Кириллица на встроенных TTF (обычный + жирный в одной строке):
+    3 повторные правки сохраняют начертания и позиции обоих спанов."""
+    regular = "/usr/share/fonts/TTF/DejaVuSans.ttf"
+    bold = "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"
+    if not (os.path.exists(regular) and os.path.exists(bold)):
+        print("test_cyrillic_embedded_mixed: skipped (нет DejaVu)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        doc = pymupdf.open()
+        page = doc.new_page()
+        bold_buf = open(bold, "rb").read()
+        page.insert_font(fontname="EdFBold", fontbuffer=bold_buf)
+        page.insert_font(fontname="EdFReg", fontbuffer=open(regular, "rb").read())
+        head = "Счёт жирный"
+        page.insert_text((72, 100.0), head, fontname="EdFBold", fontsize=12)
+        page.insert_text((72 + pymupdf.Font(fontbuffer=bold_buf).text_length(
+            head, fontsize=12), 100.0), " обычный текст", fontname="EdFReg",
+            fontsize=12)
+        doc.save(pdf)
+        doc.close()
+        ed = PdfDocument(pdf)
+        b = ed.blocks(0)[0]
+        first = [[(r["font"], r["size"], r["origin"]) for r in lr]
+                 for lr in b.line_runs]
+        assert len(first) == 1 and len(first[0]) == 2, first
+        assert "Bold" in first[0][0][0], first
+        src = pdf
+        for _ in range(3):
+            ed = PdfDocument(src)
+            b = ed.blocks(0)[0]
+            ed.set_text(0, b, b.text)
+            ed.save_as(out)
+            src = out
+        b = PdfDocument(out).blocks(0)[0]
+        assert b.text == "Счёт жирный обычный текст", f"текст: {b.text!r}"
+        assert [len(lr) for lr in b.line_runs] == [2], b.line_runs
+        for a, c in zip(first[0], b.line_runs[0]):
+            assert a[0] == c["font"], f"начертание: {a[0]} != {c['font']}"
+            assert abs(a[1] - c["size"]) < 0.01, (a, c)
+            assert all(abs(p - q) < 0.01 for p, q in zip(a[2], c["origin"])), \
+                f"позиция: {a[2]} != {c['origin']}"
+        print("test_cyrillic_embedded_mixed: ok")
+
+
+def test_htmlbox_line_mixed_sizes_stable() -> None:
+    """htmlbox-путь со смешанными размерами в строке: baseline входит по
+    отступу САМОГО крупного спана и не дрейфует при повторных правках."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((72, 100.0), "??", fontname="helv", fontsize=20)
+        page.insert_text((72 + pymupdf.get_text_length(
+            "??", fontname="helv", fontsize=20), 100.0), " abc",
+            fontname="helv", fontsize=12)
+        doc.save(pdf)
+        doc.close()
+        src = pdf
+        for _ in range(3):
+            ed = PdfDocument(src)
+            ed.set_text(0, ed.blocks(0)[0], "ЖЖ abc")
+            ed.save_as(out)
+            src = out
+        sp = _spans(out)
+        assert [round(s[1]) for s in sp] == [20, 12], sp
+        assert all(abs(s[3] - 100.0) < 0.01 for s in sp), f"baseline: {sp}"
+        print("test_htmlbox_line_mixed_sizes_stable: ok")
+
+
 if __name__ == "__main__":
     test_blocks()
     test_edit_roundtrip()
@@ -365,5 +561,12 @@ if __name__ == "__main__":
     test_line_styles_per_line()
     test_cyrillic_embedded_stable()
     test_cyrillic_htmlbox_stable()
+    test_mixed_weight_roundtrip()
+    test_mixed_weight_insert_regular()
+    test_mixed_weight_replace_bold()
+    test_mixed_weight_append()
+    test_mixed_sizes_roundtrip()
+    test_cyrillic_embedded_mixed()
+    test_htmlbox_line_mixed_sizes_stable()
     print("ALL OK")
     sys.exit(0)

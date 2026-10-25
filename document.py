@@ -1,4 +1,5 @@
 """Модель PDF-редактора: рендер, блоки текста, правка блоков. Без GUI."""
+import difflib
 import html as _html
 from dataclasses import dataclass
 
@@ -18,6 +19,9 @@ class TextBlock:
     # origin=(x, y) базовой линии — для сохранения позиций строк при правке.
     # None = не извлекалось (TextBlock создан вручную).
     line_styles: list[dict] | None = None
+    # Спаны по строкам: [[{font, size, color, origin, text}, ...], ...] —
+    # смешение начертаний внутри строки. None = не извлекалось.
+    line_runs: list[list[dict]] | None = None
 
 
 def _clean_font_name(name: str) -> str:
@@ -69,6 +73,37 @@ def _cjk_font(text: str) -> str | None:
         if 0x3400 <= o <= 0x9FFF:
             return "china-s"
     return None
+
+
+def _map_runs(old_runs: list[dict], new_text: str, fallback: dict) -> list[dict]:
+    """Прогоны для нового текста строки: посимвольно по difflib, совпавшие
+    символы берут стиль исходного символа, вставленные/заменённые — стиль
+    ближайшего предыдущего (в начале строки — первого спана). Соседние
+    символы одного стиля склеиваются в один run."""
+    src = old_runs or [dict(fallback, text=new_text)]
+    chars = [r for r in src for _ in r["text"]]
+    if not chars:
+        one = src[0]
+        return [{"text": new_text, "font": one["font"], "size": one["size"],
+                 "color": one["color"]}]
+    sm = difflib.SequenceMatcher(None, "".join(r["text"] for r in src),
+                                 new_text, autojunk=False)
+    styles = [None] * len(new_text)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            styles[j1:j2] = chars[i1:i2]
+        else:
+            prev = chars[i1 - 1] if i1 else chars[0]
+            styles[j1:j2] = [prev] * (j2 - j1)
+    runs: list[dict] = []
+    for ch, s in zip(new_text, styles):
+        if runs and (runs[-1]["font"], runs[-1]["size"], runs[-1]["color"]) == (
+                s["font"], s["size"], s["color"]):
+            runs[-1]["text"] += ch
+        else:
+            runs.append({"text": ch, "font": s["font"], "size": s["size"],
+                         "color": s["color"]})
+    return runs
 
 
 def _insert_text_fit(page, refname, text, x, y, size, color) -> bool:
@@ -131,32 +166,33 @@ class PdfDocument:
         for b in self.doc[idx].get_text("dict")["blocks"]:
             if b["type"] != 0:
                 continue
-            line_styles = []
+            line_styles, line_runs = [], []
             for line in b["lines"]:
-                spans = line["spans"]
-                if spans:
-                    s0 = spans[0]  # shortcut: смешение стилей внутри одной
-                    # строки сведено к первому span; апгрейд: посимвольные стили
-                    c = s0["color"]
-                    line_styles.append({
-                        "font": s0["font"],
-                        "size": s0["size"],
+                runs = []
+                for s in line["spans"]:
+                    c = s["color"]
+                    runs.append({
+                        "font": s["font"],
+                        "size": s["size"],
                         "color": ((c >> 16 & 255) / 255, (c >> 8 & 255) / 255,
                                   (c & 255) / 255),
-                        "origin": tuple(s0["origin"]),
+                        "origin": tuple(s["origin"]),
+                        # shortcut: TTF-буферы с LATIN-кодировкой извлекают
+                        # пробел как \xa0 (артефакт MuPDF); нормализуем, иначе
+                        # \xa0 попадает в редактор и в следующие вставки.
+                        "text": s["text"].replace("\xa0", " "),
                     })
+                line_runs.append(runs)
+                if runs:  # стиль строки (совместимость) — первый span
+                    line_styles.append({k: runs[0][k] for k in
+                                        ("font", "size", "color", "origin")})
                 else:
                     # пустая строка наследует стиль предыдущей
                     line_styles.append(dict(line_styles[-1]) if line_styles else {})
             if not line_styles:
                 continue
-            text = "\n".join(
-                # shortcut: TTF-буферы с LATIN-кодировкой извлекают пробел
-                # как \xa0 (артефакт MuPDF); нормализуем, иначе после правки
-                # \xa0 попадает в редактор и в следующие вставки.
-                "".join(s["text"] for s in line["spans"]).replace("\xa0", " ")
-                for line in b["lines"]
-            )
+            text = "\n".join("".join(r["text"] for r in runs)
+                             for runs in line_runs)
             if not text:
                 continue
             out.append(TextBlock(
@@ -166,6 +202,7 @@ class PdfDocument:
                 size=line_styles[0]["size"],
                 color=line_styles[0]["color"],
                 line_styles=line_styles,
+                line_runs=line_runs,
             ))
         return out
 
@@ -268,7 +305,16 @@ class PdfDocument:
         else:
             pts = [(s["origin"][0] + dx, s["origin"][1] + dy) for s in styles]
 
+        # Явно выбранный пользователем шрифт/размер — override на весь блок.
+        override_font = None
+        if font_choice and font_choice not in ("auto",):
+            override_font = (font_choice[4:] if font_choice.startswith("emb:")
+                             else font_choice)
+        old_runs = block.line_runs or []
+
         font_memo: dict[str, str | None] = {}
+        emb_bufs: dict[str, bytes] = {}
+        font_objs: dict[str, pymupdf.Font] = {}
 
         def emb_ref(font_name: str) -> str | None:
             """refname встроенного шрифта страницы (вставляется один раз)."""
@@ -280,31 +326,78 @@ class PdfDocument:
                 norm = key.replace(" ", "").replace("-", "")
                 buf = (font_buffers.get(key) or font_buffers.get(norm))
                 if not buf:
-                    # префиксный матч: имя спана короче /BaseFont
+                    # Префиксный матч: имя спана короче /BaseFont ("CharisSIL"
+                    # vs "Charis SIL Regular"), но начертание должно совпадать
+                    # — иначе "CharisSIL" берёт буфер "Charis SIL Bold".
+                    def face(s: str) -> tuple:
+                        return ("bold" in s,
+                                "italic" in s or "oblique" in s)
                     for k, b in font_buffers.items():
-                        if k.startswith(norm) or norm.startswith(k):
+                        if (k.startswith(norm) or norm.startswith(k)) \
+                                and face(k) == face(norm):
                             buf = b
                             break
                 ref = None
                 if buf:
                     ref = "EdF" + "".join(ch for ch in clean if ch.isalnum())[:32]
                     page.insert_font(fontname=ref, fontbuffer=buf)
+                    emb_bufs[ref] = buf
                 font_memo[key] = ref
             return font_memo[key]
 
-        def html_line(text: str, size: float, color: tuple, x: float, y: float) -> None:
-            r, g, b = color
-            body = _html.escape(text, quote=False)
-            html = (
-                f'<span style="font-size:{size:.1f}pt;'
-                f'color:rgb({r*255:.0f},{g*255:.0f},{b*255:.0f});">{body}</span>'
-            )
+        def plan_run(font_name: str, text: str) -> tuple[str, str | None]:
+            """Как вставлять прогон: emb/cjk/base — insert_text, html —
+            htmlbox (unicode без встроенного шрифта)."""
+            name = override_font or font_name
+            if name in ("china-s", "china-ss", "japan", "korea"):
+                return "cjk", name  # явный CJK-выбор пользователя
+            ref = emb_ref(name)
+            if ref is not None:
+                return "emb", ref
+            if not text.isascii():
+                cjk = _cjk_font(text)
+                return ("cjk", cjk) if cjk else ("html", None)
+            return "base", _base14_key(name)
+
+        def run_width(kind: str, refname: str, text: str, size: float) -> float:
+            """Ширина прогона тем же шрифтом, которым он вставлен."""
+            if kind == "base":
+                return pymupdf.get_text_length(text, fontname=refname,
+                                               fontsize=size)
+            if refname not in font_objs:
+                buf = emb_bufs.get(refname)
+                font_objs[refname] = (pymupdf.Font(fontbuffer=buf) if buf
+                                      else pymupdf.Font(refname))
+            return font_objs[refname].text_length(text, fontsize=size)
+
+        def html_line(runs: list[dict], y: float) -> None:
+            """Строка одним htmlbox: спаны с size/color/bold/italic — Story
+            раскладывает их по x сам (смешение начертаний внутри строки)."""
+            parts = []
+            for r in runs:
+                r_, g, b = r["color"]
+                f = _clean_font_name(r["font"]).lower()
+                extra = ("font-weight:bold;" if "bold" in f else
+                         "font-style:italic;" if ("italic" in f or "oblique" in f)
+                         else "")
+                body = _html.escape(r["text"], quote=False)
+                parts.append(
+                    f'<span style="font-size:{r["size"]:.1f}pt;'
+                    f'color:rgb({r_*255:.0f},{g*255:.0f},{b*255:.0f});{extra}">'
+                    f'{body}</span>')
+            # white-space:pre — иначе Story схлопывает/съедает пробелы и
+            # переносит строку по ширине бокса.
+            html = '<span style="white-space:pre">' + "".join(parts) + "</span>"
             # Story кладёт глифы со своим внутренним отступом от бокса,
             # зависящим только от size: измеряем его на отдельном документе
-            # (с кэшем) и входим в baseline (x, y) с первого раза. Redact-
-            # перестановка (как раньше) удаляла соседние строки: MuPDF
-            # убирает любой текст, чей bbox пересекает красакт-прямоугольник.
+            # (с кэшем) и входим в baseline (x, y) с первого раза. Отступ
+            # задаёт САМЫЙ крупный span строки (проверено: baseline смешанной
+            # строки = _story_inset(max size)). Redact-перестановка (как
+            # раньше) удаляла соседние строки: MuPDF убирает любой текст, чей
+            # bbox пересекает красакт-прямоугольник.
+            size = max(r["size"] for r in runs)
             ix, iy = _story_inset(size)
+            x = runs[0]["x"]
             box = pymupdf.Rect(x - ix, y - iy, page.rect.x1, y - iy + size * 2)
             rc = page.insert_htmlbox(box, html, scale_low=1.0)
             # rc[0]<0 = дефицит высоты: расширяем бокс вниз и пробуем снова;
@@ -319,53 +412,42 @@ class PdfDocument:
         # shortcut: redaction применён до вставки; если вставка упадёт, блок
         # уже пуст. Вызывающие (GUI) обязаны сохранить снимок до вызова;
         # библиотечные вызовы без снимка теряют текст при сбое.
-        # shortcut: одна строка шире страницы переносится htmlbox-ом при
-        # рендере (запрет переноса на ширину страницы дал бы усадку шрифта
-        # целиком); апгрейд: пост-проверка ширины спана.
+        # shortcut: переноса по ширине нет ни на одном пути (только "\\n").
+        # htmlbox-строку шире страницы Story не переносит, а усаживает
+        # (scale_low); на insert_text-пути строка уходит за правый край.
+        # Апгрейд: пост-проверка ширины строки.
         for i, ln in enumerate(lines):
             if not ln:
                 continue
             s = src_style(i)
             x, y = pts[i]
-            size = font_size if font_size else s["size"]
-            color = s["color"]
+            orig = old_runs[i] if i < len(old_runs) else []
+            if (orig and not override_font and not font_size
+                    and ln == "".join(r["text"] for r in orig)):
+                # Текст строки не изменился: спаны на своих исходных x —
+                # правка идемпотентна бит-в-бит (метрики не участвуют).
+                runs = [dict(r, x=r["origin"][0] + dx) for r in orig]
+            else:
+                runs = _map_runs(orig, ln, s)
 
-            def put(font_name: str) -> bool:
-                """Одна строка без переноса; True — вставили insert_text."""
-                ref = emb_ref(font_name)
-                if ref is not None and _insert_text_fit(
-                        page, ref, ln, x, y, size, color):
-                    return True
-                cjk = _cjk_font(ln) if not ln.isascii() else None
-                if cjk is not None:
-                    _insert_text_fit(page, cjk, ln, x, y, size, color)
-                    return True
-                if not ln.isascii():
-                    return False  # кириллица/греческий — htmlbox (unicode)
-                return _insert_text_fit(page, _base14_key(font_name),
-                                        ln, x, y, size, color)
-
-            # Явно выбранный пользователем шрифт — override на весь блок.
-            if font_choice and font_choice not in ("auto",):
-                if font_choice.startswith("emb:"):
-                    ref = emb_ref(font_choice[4:])
-                    if ref is not None and _insert_text_fit(
-                            page, ref, ln, x, y, size, color):
-                        continue
-                elif not ln.isascii() and font_choice not in (
-                        "china-s", "china-ss", "japan", "korea"):
-                    html_line(ln, size, color, x, y)
-                    continue
-                elif _insert_text_fit(page, _base14_key(font_choice),
-                                      ln, x, y, size, color):
-                    continue
-                html_line(ln, size, color, x, y)
+            plans = [(r, plan_run(r["font"], r["text"])) for r in runs]
+            explicit = "x" in runs[0]
+            if not explicit:
+                runs[0]["x"] = x
+            if any(kind == "html" for _r, (kind, _n) in plans):
+                html_line(runs, y)
                 continue
-
-            # Авто: строка наследует шрифт исходной строки i.
-            if put(s["font"]):
-                continue
-            html_line(ln, size, color, x, y)
+            for r, (kind, refname) in plans:
+                size = font_size or r["size"]
+                if not explicit:
+                    r["x"] = x
+                # insert_text не смог (низ страницы) — строка целиком через
+                # htmlbox, без потери текста.
+                if not _insert_text_fit(page, refname, r["text"], r["x"], y,
+                                        size, r["color"]):
+                    html_line([r], y)
+                elif not explicit:
+                    x = r["x"] + run_width(kind, refname, r["text"], size)
 
     def save_as(self, path: str) -> None:
         if path == self.path:

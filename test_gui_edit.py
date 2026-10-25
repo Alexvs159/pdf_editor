@@ -153,6 +153,19 @@ item.setSelected(False)
 check("4b. клик мимо блоков закрывает редактор", WIN.overlay is None)
 check("4b. текст не изменился", not any("QQQ MISS" in b.text for b in WIN.blocks))
 
+# --- 8. оверлей растёт по ширине и не переносит строку сам
+item = find_block(WIN.blocks[0].text[:10])
+WIN.start_edit(item)
+ov = WIN.overlay
+w1, h1 = ov.boundingRect().width(), ov.boundingRect().height()
+ov.setPlainText(ov.toPlainText().split("\n")[0] + " " + "LONGER TEXT " * 6)
+w2, h2 = ov.boundingRect().width(), ov.boundingRect().height()
+check("8. оверлей вырос по ширине", w2 > w1 * 1.4)
+check("8. переноса нет (одна строка)", h2 < h1)
+check("8. подложка закрывает текст", WIN.overlay_bg.rect().width() >= w2 - 1)
+WIN.cancel_edit()
+check("8. отмена убирает оверлей", WIN.overlay is None)
+
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 WIN.close()  # closeEvent покажет подтверждение несохранённых правок

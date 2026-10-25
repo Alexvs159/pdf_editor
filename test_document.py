@@ -548,6 +548,26 @@ def test_htmlbox_line_mixed_sizes_stable() -> None:
         print("test_htmlbox_line_mixed_sizes_stable: ok")
 
 
+def test_htmlbox_long_line_keeps_size() -> None:
+    """htmlbox-путь: длинная строка растёт вправо за край бокса, а не
+    усаживается (scale_low) из-за того, что бокс обрезан краем страницы."""
+    with tempfile.TemporaryDirectory() as d:
+        pdf, out = os.path.join(d, "t.pdf"), os.path.join(d, "o.pdf")
+        doc = pymupdf.open()
+        doc.new_page().insert_textbox(pymupdf.Rect(72, 72, 300, 120), "ЖЖ",
+                                      fontname="helv", fontsize=12)
+        doc.save(pdf)
+        doc.close()
+        ed = PdfDocument(pdf)
+        b = ed.blocks(0)[0]
+        ed.set_text(0, b, b.text + " длинный текст" * 8)
+        ed.save_as(out)
+        sp = _spans(out)
+        assert len(sp) == 1, f"перенос строки: {len(sp)}"
+        assert abs(sp[0][1] - 12.0) < 0.5, f"размер усажен: {sp[0][1]}"
+        print("test_htmlbox_long_line_keeps_size: ok")
+
+
 if __name__ == "__main__":
     test_blocks()
     test_edit_roundtrip()
@@ -568,5 +588,6 @@ if __name__ == "__main__":
     test_mixed_sizes_roundtrip()
     test_cyrillic_embedded_mixed()
     test_htmlbox_line_mixed_sizes_stable()
+    test_htmlbox_long_line_keeps_size()
     print("ALL OK")
     sys.exit(0)

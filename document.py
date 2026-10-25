@@ -398,16 +398,20 @@ class PdfDocument:
             size = max(r["size"] for r in runs)
             ix, iy = _story_inset(size)
             x = runs[0]["x"]
+            # Бокс не обрезаем по краю страницы: иначе Story усаживает
+            # строку (scale_low) вместо роста вправо. Точную ширину строки
+            # заранее не знаем (метрики Story-гарнитуры), поэтому при
+            # неудаче расширяем бокс и пробуем снова. scale_low=0
+            # (беззвучная усадка) — только последний рубеж.
             box = pymupdf.Rect(x - ix, y - iy, page.rect.x1, y - iy + size * 2)
-            rc = page.insert_htmlbox(box, html, scale_low=1.0)
-            # rc[0]<0 = дефицит высоты: расширяем бокс вниз и пробуем снова;
-            # scale_low=0 (беззвучная усадка) — только если упёрлись в низ
-            # страницы.
-            if isinstance(rc, tuple) and rc and rc[0] < 0:
-                box.y1 = min(box.y1 - rc[0] + 2, page.rect.y1)
+            for _ in range(4):
                 rc = page.insert_htmlbox(box, html, scale_low=1.0)
-                if isinstance(rc, tuple) and rc and rc[0] < 0:
-                    page.insert_htmlbox(box, html, scale_low=0.0)
+                if not (isinstance(rc, tuple) and rc and rc[0] < 0):
+                    break
+                box.x1 += 200  # вправо за край страницы — не перенос, а рост
+                box.y1 = min(box.y1 + 20, page.rect.y1)
+            else:
+                page.insert_htmlbox(box, html, scale_low=0.0)
 
         # shortcut: redaction применён до вставки; если вставка упадёт, блок
         # уже пуст. Вызывающие (GUI) обязаны сохранить снимок до вызова;

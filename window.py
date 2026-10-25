@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
         self._undo_stack = []
         self.overlay: QGraphicsTextItem | None = None  # in-place редактор
         self.overlay_bg = None                         # белая подложка под ним
+        self.edit_rect = None                          # исходный rect блока
 
         self.setWindowTitle("PDF Editor")
         self.resize(1280, 860)
@@ -228,6 +229,7 @@ class MainWindow(QMainWindow):
         item.setSelected(True)
         b = self.blocks[item.data(0)]
         rect = item.sceneBoundingRect()
+        self.edit_rect = rect
         self.overlay_bg = self.scene.addRect(
             rect, pen=QPen(Qt.PenStyle.NoPen), brush=QColor(255, 255, 255))
         t = QGraphicsTextItem()
@@ -239,14 +241,24 @@ class MainWindow(QMainWindow):
         t.setFont(f)
         t.setDefaultTextColor(QColor(0, 0, 0))
         t.setPlainText(b.text)
-        t.setTextWidth(rect.width())
+        # Без ограничения ширины: текст не переносится сам, только по Enter.
+        t.setTextWidth(-1)
         t.setPos(rect.topLeft())
         t.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
         t.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsFocusable, True)
         t.setZValue(1)
         self.overlay = t
         self.scene.addItem(t)
+        t.document().contentsChanged.connect(self._fit_overlay_bg)
+        self._fit_overlay_bg()
         t.setFocus()
+
+    def _fit_overlay_bg(self) -> None:
+        """Подложка растёт вместе с текстом по горизонтали и вертикали."""
+        if self.overlay is None or self.overlay_bg is None:
+            return
+        r = self.overlay.mapRectToScene(self.overlay.boundingRect())
+        self.overlay_bg.setRect(r.united(self.edit_rect))
 
     def _overlay_text(self) -> str:
         # toPlainText() может дать U+2029 как разделитель абзацев —

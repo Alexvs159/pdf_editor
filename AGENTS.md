@@ -186,7 +186,8 @@
   (`git -c user.name=opencode -c user.email=opencode@localhost commit …`),
   глобальный git config не менять.
 - Логические коммиты небольшими шагами (скелет → модель → GUI → фиксы).
-- Не коммитить `.venv/`, `__pycache__/`, `*.pdf`.
+- Не коммитить `.venv/`, `__pycache__/`, `*.pdf`, `.codebase-memory/`
+  (локальный кэш индекса), `opencode.json` (локальный конфиг MCP).
 
 ## Известные ограничения
 

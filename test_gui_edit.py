@@ -265,6 +265,39 @@ check("12. размер применён без редактора", sizes12 and
 check("12. правка помечена как несохранённая", WIN._dirty is True)
 QMessageBox.information = _saved_info
 
+# --- 13. печать: парсер диапазонов и постраничная печать в PDF-принтер
+from window import parse_page_ranges
+from PyQt6.QtPrintSupport import QPrinter
+
+check("13. парсер 1,3,5-7", parse_page_ranges("1,3,5-7", 10) == [0, 2, 4, 5, 6])
+check("13. парсер пусто = весь документ", parse_page_ranges("", 3) == [0, 1, 2])
+check("13. парсер перевёрнутый диапазон (возрастание)", parse_page_ranges("5-3", 10) == [2, 3, 4])
+check("13. парсер пробелы", parse_page_ranges(" 2 , 4-5 ", 10) == [1, 3, 4])
+try:
+    parse_page_ranges("0", 10); check("13. парсер 0 = ошибка", False)
+except ValueError:
+    check("13. парсер 0 = ошибка", True)
+try:
+    parse_page_ranges("11", 10); check("13. парсер за пределом = ошибка", False)
+except ValueError:
+    check("13. парсер за пределом = ошибка", True)
+try:
+    parse_page_ranges("abc", 10); check("13. парсер мусор = ошибка", False)
+except ValueError:
+    check("13. парсер мусор = ошибка", True)
+
+out_pdf = os.path.join(os.path.dirname(SAMPLE), "printed.pdf")
+printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+printer.setOutputFileName(out_pdf)
+WIN.print_pages_to(printer, [0, 0])  # две страницы — одна исходная дважды
+printed = pymupdf.open(out_pdf)
+check("13. напечатано 2 страницы", len(printed) == 2)
+check("13. страница — отрисованный растр",
+      all(len(printed[i].get_images()) == 1
+          and any(px < 200 for px in printed[i].get_pixmap().samples)
+          for i in (0, 1)))
+
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 WIN.close()  # closeEvent покажет подтверждение несохранённых правок

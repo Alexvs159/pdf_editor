@@ -8,14 +8,16 @@ import os
 
 from PyQt6.QtCore import QRectF, QSize, Qt, QTimer
 from PyQt6.QtGui import (
-    QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPen, QPixmap, QShortcut,
+    QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
+    QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QGraphicsRectItem, QGraphicsScene, QGraphicsTextItem, QGraphicsView,
-    QSplitter, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QPushButton, QGraphicsRectItem, QGraphicsScene, QGraphicsTextItem,
+    QGraphicsView, QSplitter, QVBoxLayout, QWidget,
 )
+from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 
 import pymupdf
 
@@ -23,6 +25,29 @@ from document import PdfDocument, _base14_key, _clean_font_name
 
 THUMB_W = 120
 VIEW_ZOOM = 2.0
+
+
+def parse_page_ranges(spec: str, total: int) -> list[int]:
+    """'1,3,5-7' → [0,2,4,5,6]; пусто → все страницы. ValueError при выходе
+    за пределы или нечисловом вводе."""
+    spec = spec.strip()
+    if not spec:
+        return list(range(total))
+    pages: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            first, last = int(lo), int(hi)
+            if first > last:
+                first, last = last, first
+            pages.extend(range(first - 1, last))
+        else:
+            pages.append(int(part) - 1)
+    bad = next((p for p in pages if not 0 <= p < total), None)
+    if bad is not None:
+        raise ValueError(f"Нет страницы {bad + 1} (всего страниц: {total})")
+    return pages
 
 
 def pixmap_to_qimage(pix: pymupdf.Pixmap) -> QImage:
@@ -135,6 +160,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
         QShortcut(QKeySequence("Escape"), self, self.cancel_edit)
         QShortcut(QKeySequence("Ctrl+S"), self, self.prompt_save)
+        QShortcut(QKeySequence("Ctrl+P"), self, self.print_pages)
 
         menu = self.menuBar().addMenu("&Файл")
         act_open = QAction("&Открыть…", self)
@@ -143,8 +169,12 @@ class MainWindow(QMainWindow):
         act_save = QAction("Сохранить &как…", self)
         act_save.setShortcut(QKeySequence("Ctrl+S"))
         act_save.triggered.connect(self.prompt_save)
+        act_print = QAction("&Печать…", self)
+        act_print.setShortcut(QKeySequence("Ctrl+P"))
+        act_print.triggered.connect(self.print_pages)
         menu.addAction(act_open)
         menu.addAction(act_save)
+        menu.addAction(act_print)
 
         if pdf_path:
             self.open_pdf(pdf_path)
@@ -206,6 +236,56 @@ class MainWindow(QMainWindow):
             return
         self._dirty = False
         QMessageBox.information(self, "PDF Editor", f"Сохранено: {path}")
+
+    def print_pages(self) -> None:
+        """Печать через системный диалог: выбор страниц — номера/диапазоны."""
+        if not self.doc:
+            return
+        spec, ok = QInputDialog.getText(
+            self, "Печать",
+            f"Страницы: номера через запятую или диапазоны (например 1,3,5-7).\n"
+            f"Пусто — весь документ. Всего страниц: {self.doc.page_count}.")
+        if not ok:
+            return
+        try:
+            pages = parse_page_ranges(spec, self.doc.page_count)
+        except ValueError as e:
+            QMessageBox.warning(self, "PDF Editor", str(e))
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setDocName(os.path.basename(self.doc.path))
+        if QPrintDialog(printer, self).exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.print_pages_to(printer, pages)
+        except Exception as e:
+            # Исключение в слоте Qt роняет приложение — как при сохранении.
+            QMessageBox.critical(self, "PDF Editor", f"Не удалось напечатать:\n{e}")
+
+    def print_pages_to(self, printer: QPrinter, pages: list[int]) -> None:
+        """Печать выбранных страниц: рендер модели постранично как изображение."""
+        painter = QPainter()
+        if not painter.begin(printer):
+            raise RuntimeError("Принтер недоступен")
+        try:
+            for pos, i in enumerate(pages):
+                if pos:
+                    printer.newPage()
+                img = pixmap_to_qimage(self.doc.page_pixmap(i, zoom=2.5))
+                # Логическая система координат — страница принтера в пунктах.
+                page = printer.pageRect(QPrinter.Unit.Point)
+                if not page.isValid():
+                    page = printer.paperRect(QPrinter.Unit.Point)
+                painter.setWindow(page.toRect())
+                size = img.size().scaled(page.size().toSize(),
+                                         Qt.AspectRatioMode.KeepAspectRatio)
+                target = QRectF(
+                    page.x() + (page.width() - size.width()) / 2,
+                    page.y() + (page.height() - size.height()) / 2,
+                    size.width(), size.height())
+                painter.drawImage(target, img)
+        finally:
+            painter.end()
 
     def set_block_controls_enabled(self, on: bool) -> None:
         """Параметры шрифта и Применить/Отмена — только при выбранном блоке."""

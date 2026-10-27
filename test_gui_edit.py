@@ -298,6 +298,34 @@ check("13. страница — отрисованный растр",
           and any(px < 200 for px in printed[i].get_pixmap().samples)
           for i in (0, 1)))
 
+# --- 14. GTK-шум платформенной темы Qt подавлен (_quiet_gtk_log)
+import ctypes
+import main as _main
+_glib = ctypes.CDLL("libglib-2.0.so.0")
+_gobj = ctypes.CDLL("libgobject-2.0.so.0")
+_glib.g_log.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+_glib.g_log.restype = None
+
+def _gtk_noise():
+    _gobj.g_object_unref(None)  # GLib-GObject-CRITICAL
+    _glib.g_log(b"Gtk", 1 << 4, b"Could not load a pixbuf from icon theme.")
+
+def _capture2(fn):
+    import tempfile
+    f = tempfile.TemporaryFile(); saved = os.dup(2); os.dup2(f.fileno(), 2)
+    try:
+        fn()
+    finally:
+        os.dup2(saved, 2); os.close(saved)
+        f.seek(0); out = f.read().decode(errors="replace"); f.close()
+    return out
+
+noise_before = _capture2(_gtk_noise)
+_main._quiet_gtk_log()
+noise_after = _capture2(_gtk_noise)
+check("14. шум GTK до глушителя виден", "GLib-GObject" in noise_before)
+check("14. шум GTK после глушителя нет", noise_after == "")
+
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 WIN.close()  # closeEvent покажет подтверждение несохранённых правок

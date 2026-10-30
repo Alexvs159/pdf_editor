@@ -116,9 +116,11 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
 ## Граф кода (codebase-memory)
 
 Проект проиндексирован в codebase-memory-mcp (проект `pdf_editor`, full-режим,
-191 узел / 900 рёбер, генерация 2026-10-27T10:56:27Z — до OCR-коммитов;
-после них граф устарел, нужен реиндекс `index_repository`). Анализ кода —
-graph-first, для экономии контекста:
+272 узла / 1244 ребра, генерация 2026-10-30T11:45:32Z). MCP-сервер
+`codebase-memory` подключён на project-local scope
+(`~/.commandcode/projects/<slug>/mcp.json`, команда
+`/home/alex/.local/bin/codebase-memory-mcp`). Анализ кода — graph-first,
+для экономии контекста:
 
 1. `search_graph` / `get_architecture` — найти символ, обзор.
 2. `trace_path` — кто вызывает / что вызывает (например `set_text`).
@@ -126,6 +128,9 @@ graph-first, для экономии контекста:
 4. `detect_changes` — impact коммита/диффа.
 5. `check_index_coverage` — подтвердить свежесть перед выводами; после
    коммитов реиндекс (`index_repository`, тот же `repo_path`).
+- Реиндекс без MCP-сессии: `codebase-memory-mcp cli index_repository
+  '{"repo_path": "/home/alex/projects/pdf_editor", "mode": "full"}'`;
+  счётчики графа после реиндекса обновляются в AGENTS.md (docs-коммит).
 - grep/чтение файлов — только для строк-литералов, конфигов и тёмных зон графа.
 - Актуальная документация библиотек (PyMuPDF, PyQt6) — через context7,
   не по памяти. Минимальность решения — ponytail (см. ниже).

@@ -46,9 +46,11 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
   - `apply_ocr(idx, blocks, font_path)` — невидимый текстовый слой OCR:
     `insert_text(render_mode=3)` построчно (redaction НЕ нужен), baseline из
     rect'ов строк детекции, иначе равномерно по bbox абзаца. Шрифт: ASCII —
-    `helv`; кириллица/греческий — буфер системного TTF (`PDF_OCR_FONT` →
-    DejaVu/Liberation/Noto, кэш); CJK — reserved имена. htmlbox здесь
-    недопустим: он вставляется видимым. `OcrBlock` — rect/размер/строки/текст.
+    Base-14 по начертанию (`OcrBlock.style`: bold/italic/serif/mono →
+    `hebo`/`tiit`/…); кириллица/греческий — буфер системного TTF
+    (`PDF_OCR_FONT` → DejaVu/Liberation/Noto, кэш; начертание не
+    применяется); CJK — reserved имена. htmlbox здесь недопустим: он
+    вставляется видимым. `OcrBlock` — rect/размер/строки/текст/style.
   - Вся логика шрифтов и redaction — здесь.
 - `window.py` — главное окно PyQt6: миниатюры слева, `QGraphicsView` с
   рамками блоков по центру (`BlockItem`: выделение, перетаскивание,
@@ -93,7 +95,10 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
     колоночный профиль, склейка строк в абзацы (зазор `< 0.8*высота`,
     горизонтальное перекрытие `>= 50%`). Координаты — сразу в PDF-пунктах.
   - `OcrClient` — OpenAI-совместимый `/chat/completions` (stdlib urllib),
-    base64-PNG кропа, `temperature=0`; ответ — текст, фенсы снимаются.
+    base64-PNG кропа, `temperature=0`; ответ — JSON `{text, bold, italic,
+    serif, mono}` (`_parse_reply`); не-JSON ответ = просто текст, стиль
+    остаётся эвристике. `_estimate_style` — толщина штриха (bold) и
+    наклон центроида (italic) по растру; явные теги LLM перекрывают её.
   - `run_page_ocr` — detection → кропы → параллельные вызовы
     (`ThreadPoolExecutor`, один ретрай на кроп). LLM видит только кроп и
     НЕ отдаёт координаты: boxes всегда от детекции.
@@ -207,8 +212,10 @@ graph-first, для экономии контекста:
   детекция на синтетическом растре (`test_ocr_detection_synthetic`),
   невидимая вставка + кириллица после сохранения
   (`test_ocr_apply_invisible`), abort-политика
-  (`test_ocr_page_abort_policy`), очистка ответа LLM (`test_ocr_clean_text`).
-  Запуск: `.venv/bin/python test_document.py`.
+  (`test_ocr_page_abort_policy`), очистка ответа LLM (`test_ocr_clean_text`),
+  JSON-теги стиля (`test_ocr_parse_reply`), маппинг начертания в Base-14
+  (`test_ocr_style_mapping`), эвристики bold/italic по растру
+  (`test_ocr_style_heuristics`). Запуск: `.venv/bin/python test_document.py`.
 - `test_gui_edit.py` — GUI-смоки in-place правки с `QT_QPA_PLATFORM=offscreen`
   (двойной клик → оверлей, `\n`, Применить/Отмена/Esc, undo, перемещение,
   override размера, «Авто», панель без выбора, перехват ошибки сохранения,
@@ -260,6 +267,9 @@ graph-first, для экономии контекста:
   текст задваивается; растр остаётся позади (shortcut в коде).
 - OCR: детекция только тёмное-на-светлом и без deskew — инверсные/перекошенные
   (> ~3°) сканы ломают профили; крупные рисунки могут приниматься за текст.
+- OCR: начертание (bold/italic/serif/mono) применяется только к ASCII-тексту;
+  кириллица вставляется единым системным TTF. Эвристика bold может ложно
+  срабатывать на сплошных плашках/логотипах (широкие штрихи).
 - OCR: невидимый слой не умеет htmlbox → не-ASCII скрипты кроме
   кириллицы/греческого/CJK дают `ValueError` (нужен TTF через `PDF_OCR_FONT`).
 - OCR: повёрнутые страницы (`page.rotation != 0`) пропускаются с

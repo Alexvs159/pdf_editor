@@ -312,8 +312,8 @@ class _FakeOcr:
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def transcribe_crop(self, png: bytes) -> str:
-        return "OCR fake text"
+    def transcribe_crop(self, png: bytes) -> tuple[str, dict]:
+        return "OCR fake text", {}
 
 
 ocr.OcrClient = _FakeOcr

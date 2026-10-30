@@ -663,22 +663,25 @@ def test_ocr_detection_synthetic() -> None:
 class _FakeClient:
     """Подменяет ocr.OcrClient: canned-ответы или raise."""
     canned: dict[int, str] = {}
+    styles: dict[int, dict] = {}
     fail_all: bool = False
     n: int = 0
 
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def transcribe_crop(self, png: bytes) -> str:
+    def transcribe_crop(self, png: bytes) -> tuple[str, dict]:
         if _FakeClient.fail_all:
             raise ocr.OcrError("fake API error")
         _FakeClient.n += 1
-        return _FakeClient.canned.get(_FakeClient.n - 1, "")
+        i = _FakeClient.n - 1
+        return _FakeClient.canned.get(i, ""), _FakeClient.styles.get(i, {})
 
 
-def _reset_fake(canned=None, fail_all: bool = False) -> None:
+def _reset_fake(canned=None, fail_all: bool = False, styles=None) -> None:
     ocr.OcrClient = _FakeClient  # изоляция от сети для всех OCR-тестов
     _FakeClient.canned = canned or {}
+    _FakeClient.styles = styles or {}
     _FakeClient.fail_all = fail_all
     _FakeClient.n = 0
 
@@ -739,6 +742,68 @@ def test_ocr_clean_text() -> None:
     print("test_ocr_clean_text: ok")
 
 
+def test_ocr_parse_reply() -> None:
+    t, s = ocr._parse_reply('{"text": "привет", "bold": true, "italic": false}')
+    assert t == "привет" and s == {"bold": True, "italic": False}
+    t, s = ocr._parse_reply('```json\n{"text": "x", "serif": true}\n```')
+    assert t == "x" and s == {"serif": True}
+    t, s = ocr._parse_reply("просто текст")
+    assert t == "просто текст" and s == {}
+    t, s = ocr._parse_reply('{"no_text": 1}')
+    assert s == {}
+    print("test_ocr_parse_reply: ok")
+
+
+def test_ocr_style_mapping() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        _ocr_pdf(path)
+        doc = PdfDocument(path)
+        doc.apply_ocr(0, [OcrBlock(
+            rect=pymupdf.Rect(70, 60, 300, 90), text="Bold sample", size=12,
+            lines=[pymupdf.Rect(70, 60, 300, 90)], style={"bold": True})])
+        doc.apply_ocr(1, [OcrBlock(
+            rect=pymupdf.Rect(70, 60, 300, 90), text="Italic serif", size=12,
+            lines=[pymupdf.Rect(70, 60, 300, 90)],
+            style={"serif": True, "italic": True})])
+
+        def fonts(i):
+            return [s["font"]
+                    for b in doc.doc[i].get_text("dict")["blocks"]
+                    if b["type"] == 0 for l in b["lines"] for s in l["spans"]]
+
+        assert any("Bold" in f for f in fonts(0)), fonts(0)
+        assert any("Times" in f and "Italic" in f for f in fonts(1)), fonts(1)
+        print("test_ocr_style_mapping: ok")
+
+
+def _style_pixmap(bold: bool, italic: bool) -> pymupdf.Pixmap:
+    """Растр строки «текста»: вертикальные штрихи (полосы %) по строке."""
+    z = 2.0
+    W, H = 300, 160
+    img = np.full((int(H * z), int(W * z), 3), 255, dtype=np.uint8)
+    h = int(16 * z)
+    thick = 5 if bold else 2
+    for r in range(h):
+        off = int(40 * r / h) if italic else 0
+        row = img[int(40 * z) + r]
+        xs = np.arange(200)
+        row[off:off + len(xs)][(xs % 10) < thick] = 0
+    return pymupdf.Pixmap(pymupdf.csRGB, img.shape[1], img.shape[0],
+                          img.tobytes(), 0)
+
+
+def test_ocr_style_heuristics() -> None:
+    for bold, italic in ((False, False), (True, False), (False, True)):
+        pm = _style_pixmap(bold, italic)
+        blocks = ocr.detect_text_blocks(pm.samples, pm.width, pm.height, 2.0)
+        assert len(blocks) == 1, f"ожидался один блок, {len(blocks)}"
+        style = blocks[0].style
+        assert bool(style.get("bold")) == bold, f"bold={bold}, {style}"
+        assert bool(style.get("italic")) == italic, f"italic={italic}, {style}"
+    print("test_ocr_style_heuristics: ok")
+
+
 if __name__ == "__main__":
     test_blocks()
     test_edit_roundtrip()
@@ -766,5 +831,8 @@ if __name__ == "__main__":
     test_ocr_apply_invisible()
     test_ocr_page_abort_policy()
     test_ocr_clean_text()
+    test_ocr_parse_reply()
+    test_ocr_style_mapping()
+    test_ocr_style_heuristics()
     print("ALL OK")
     sys.exit(0)

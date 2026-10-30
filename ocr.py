@@ -74,7 +74,7 @@ def detect_text_blocks(samples: bytes, width: int, height: int,
     # shortcut: крупный рисунок (высота > 4×медианы) не отбрасывается —
     # апгрейд при проблемах с колонтитулами-логотипами.
     boxes = [b for b in boxes if b[3] - b[1] >= max(0.35 * med_h, 6)]
-    return _group_blocks(sorted(boxes), zoom)
+    return _group_blocks(sorted(boxes), zoom, dark)
 
 
 def _consecutive_rows(idx: np.ndarray) -> list[tuple[int, int]]:
@@ -104,8 +104,8 @@ def _line_boxes(runs: list[tuple[int, int]], dark: np.ndarray
     return out
 
 
-def _group_blocks(lines: list[tuple[int, int, int, int]], zoom: float
-                  ) -> list[OcrBlock]:
+def _group_blocks(lines: list[tuple[int, int, int, int]], zoom: float,
+                  dark: np.ndarray) -> list[OcrBlock]:
     """Строки → абзацы: вертикальный зазор < 0.8 высоты строки И
     горизонтальное перекрытие ≥ 50% меньшей ширины (колонки не сцепляются).
     Координаты переводятся из пикселей зума в пункты PDF."""
@@ -124,8 +124,44 @@ def _group_blocks(lines: list[tuple[int, int, int, int]], zoom: float
         line_rects = [pymupdf.Rect(l[0] * z, l[1] * z, l[2] * z, l[3] * z)
                       for l in g]
         size = float(np.median([(l[3] - l[1]) / 0.9 for l in g])) * z
-        out.append(OcrBlock(rect=rect, text="", size=size, lines=line_rects))
+        out.append(OcrBlock(rect=rect, text="", size=size, lines=line_rects,
+                            style=_estimate_style(dark, g)))
     return out
+
+
+def _estimate_style(dark: np.ndarray,
+                    lines: list[tuple[int, int, int, int]]) -> dict:
+    """Начертание по растру (страховка, когда LLM не отдал теги):
+    bold — медианная толщина штриха относительно высоты строки;
+    italic — сдвиг центроида чернил от верха к низу строки."""
+    bold_votes = italic_votes = 0
+    for x0, y0, x1, y1 in lines:
+        h = y1 - y0
+        if h < 6:
+            continue
+        seg = dark[y0:y1, x0:x1]
+        strokes = []
+        for row in seg:
+            edges = np.diff(np.concatenate(([0], row.view(np.int8), [0])))
+            starts = np.flatnonzero(edges == 1)
+            ends = np.flatnonzero(edges == -1)
+            strokes.extend((ends - starts).tolist())
+        if strokes:
+            bold_votes += np.median(strokes) / h > 0.13
+        rr, cc = seg.nonzero()
+        if len(rr) >= 8:
+            top = cc[rr < h * 0.25]
+            bottom = cc[rr > h * 0.75]
+            if len(top) and len(bottom) and bottom.mean() - top.mean() \
+                    > 0.18 * h:
+                italic_votes += 1
+    half = max(len(lines) / 2, 1)
+    style = {}
+    if bold_votes >= half:
+        style["bold"] = True
+    if italic_votes >= half:
+        style["italic"] = True
+    return style
 
 
 def _same_para(prev: tuple, ln: tuple, med_h: float) -> bool:
@@ -137,16 +173,21 @@ def _same_para(prev: tuple, ln: tuple, med_h: float) -> bool:
 
 # --- LLM-клиент ---------------------------------------------------------------
 
-_PROMPT = ("Транскрибируй дословно весь текст с изображения. "
-           "Сохраняй переносы строк. Не добавляй пояснений, markdown "
-           "или кавычек. Если текста нет, верни пустую строку.")
+_PROMPT = (
+    "Транскрибируй дословно текст с изображения, сохраняя переносы строк. "
+    "Верни строго JSON без пояснений и markdown: "
+    '{"text": "<текст>", "bold": true|false, "italic": true|false, '
+    '"serif": true|false, "mono": true|false} — теги начертания по виду '
+    "шрифта на изображении. Если текста нет, text — пустая строка.")
 
 
 class OcrClient:
     def __init__(self, cfg: OcrConfig):
         self.cfg = cfg
 
-    def transcribe_crop(self, png: bytes) -> str:
+    def transcribe_crop(self, png: bytes) -> tuple[str, dict]:
+        """Кроп → (текст, стиль). Стиль — только явные теги из JSON;
+        отсутствующие заполняет эвристика детекции."""
         payload = {
             "model": self.cfg.model,
             "temperature": 0,
@@ -175,7 +216,24 @@ class OcrClient:
             content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             raise OcrError(f"неожиданный ответ API: {body}") from None
-        return _clean_text(content)
+        return _parse_reply(content)
+
+
+_STYLE_KEYS = ("bold", "italic", "serif", "mono")
+
+
+def _parse_reply(content: str) -> tuple[str, dict]:
+    """Ответ модели → (текст, теги стиля). Не-JSON ответ — просто текст
+    (модель проигнорировала формат), стиль останется на эвристике."""
+    raw = _clean_text(content)
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw, {}
+    if not isinstance(obj, dict) or not isinstance(obj.get("text"), str):
+        return raw, {}
+    style = {k: bool(obj[k]) for k in _STYLE_KEYS if k in obj}
+    return obj["text"].strip(), style
 
 
 def _body_text(e: urllib.error.HTTPError) -> str:
@@ -206,7 +264,7 @@ def run_page_ocr(cfg: OcrConfig, pixmap: pymupdf.Pixmap, zoom: float,
         return []
     crops = [_crop_png(pixmap, b, zoom) for b in blocks]
 
-    def one(b: OcrBlock, png: bytes) -> str:
+    def one(b: OcrBlock, png: bytes) -> tuple[str, dict]:
         c = OcrClient(cfg)
         try:
             return c.transcribe_crop(png)
@@ -216,7 +274,9 @@ def run_page_ocr(cfg: OcrConfig, pixmap: pymupdf.Pixmap, zoom: float,
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(one, b, png) for b, png in zip(blocks, crops)]
         for b, fut in zip(blocks, futures):
-            b.text = fut.result()
+            text, style = fut.result()
+            # Явные теги LLM перекрывают эвристику; недостающие — из неё.
+            b.text, b.style = text, {**b.style, **style}
     return [b for b in blocks if b.text]
 
 

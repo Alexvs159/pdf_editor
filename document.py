@@ -1,7 +1,7 @@
 """Модель PDF-редактора: рендер, блоки текста, правка блоков. Без GUI."""
 import difflib
 import html as _html
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pymupdf
 
@@ -41,11 +41,13 @@ def _clean_font_name(name: str) -> str:
 class OcrBlock:
     """Блок, найденный детекцией на растре страницы OCR (ocr.py).
     rect/lines — координаты PDF; lines — rect каждой строки абзаца;
-    text заполняется после транскрипции."""
+    text заполняется после транскрипции; style — начертание
+    ({bold|italic|serif|mono: True}), от LLM и/или эвристики."""
     rect: pymupdf.Rect
     text: str
     size: float
     lines: list[pymupdf.Rect]
+    style: dict = field(default_factory=dict)
 
 
 # Короткие зарезервированные имена Base-14: MuPDF считает метрики по-разному
@@ -481,7 +483,7 @@ class PdfDocument:
             ln_texts = [ln for ln in b.text.split("\n") if ln]
             if not ln_texts:
                 continue
-            font_name = self._ocr_font(page, "".join(b.text),
+            font_name = self._ocr_font(page, "".join(b.text), b.style,
                                        font_path=font_path)
             if len(ln_texts) == len(b.lines):
                 baselines = [r.y1 - 0.2 * b.size for r in b.lines]
@@ -497,20 +499,25 @@ class PdfDocument:
                 page.insert_text((b.rect.x0, y), ln, fontname=font_name,
                                  fontsize=b.size, render_mode=3)
 
-    def _ocr_font(self, page, text: str,
+    def _ocr_font(self, page, text: str, style: dict,
                   font_path: str | None = None) -> str:
-        """refname шрифта невидимого слоя по скрипту текста.
+        """refname шрифта невидимого слоя по скрипту текста и начертанию.
 
         htmlbox (кириллица не влезает в Base-14) здесь не вариант: он
-        вставляется видимым. Не-ASCII скрипты — системный TTF со шрифа
-        -товой поддержкой (буфер), CJK — reserved имена, иначе helv."""
+        вставляется видимым. Не-ASCII скрипты — системный TTF с шрифтовой
+        поддержкой (буфер), CJK — reserved имена, ASCII — Base-14 по
+        начертанию (bold/italic/serif/mono из OCR)."""
         if any("\u0400" <= c <= "\u04FF" or "\u0370" <= c <= "\u03FF"
                for c in text):
             buf = _cyr_font_buffer(font_path)
             page.insert_font(fontname="OcrFSil", fontbuffer=buf)
             return "OcrFSil"
         cjk = _cjk_font(text)
-        return cjk if cjk else "helv"
+        if cjk:
+            return cjk
+        name = " ".join(k for k in ("serif", "mono", "bold", "italic")
+                        if style.get(k))
+        return _base14_key(name)
 
 
 # Порядок кандидатов: Linux → Windows → macOS. Все — регулярные начертания

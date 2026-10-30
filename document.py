@@ -37,6 +37,17 @@ def _clean_font_name(name: str) -> str:
     return name.split("+")[-1].strip()
 
 
+@dataclass
+class OcrBlock:
+    """Блок, найденный детекцией на растре страницы OCR (ocr.py).
+    rect/lines — координаты PDF; lines — rect каждой строки абзаца;
+    text заполняется после транскрипции."""
+    rect: pymupdf.Rect
+    text: str
+    size: float
+    lines: list[pymupdf.Rect]
+
+
 # Короткие зарезервированные имена Base-14: MuPDF считает метрики по-разному
 # для "helv" и "helvetica", длинное имя даёт ложный дефицит ширины и вечную
 # усадку при повторных правках. Вставляем только по коротким именам.
@@ -455,3 +466,89 @@ class PdfDocument:
         else:
             self.doc.save(path)
         self.path = path
+
+    def apply_ocr(self, idx: int, blocks: list[OcrBlock],
+                  font_path: str | None = None) -> None:
+        """Невидимый текстовый слой по блокам OCR.
+
+        Блоки вставляются через render_mode=3 (текст есть для поиска/копи
+        -рования, не виден поверх растра). Baseline: если строк LLM
+        столько же, сколько строк детекции — по rect'ам строк; иначе
+        равномерно внутри bbox абзаца.
+        """
+        page = self.doc[idx]
+        for b in blocks:
+            ln_texts = [ln for ln in b.text.split("\n") if ln]
+            if not ln_texts:
+                continue
+            font_name = self._ocr_font(page, "".join(b.text),
+                                       font_path=font_path)
+            if len(ln_texts) == len(b.lines):
+                baselines = [r.y1 - 0.2 * b.size for r in b.lines]
+            elif len(ln_texts) == 1:
+                baselines = [b.rect.y1 - 0.2 * b.size]
+            else:
+                y_first = b.rect.y0 + 0.75 * b.size
+                y_last = b.rect.y1 - 0.2 * b.size
+                step = (y_last - y_first) / (len(ln_texts) - 1)
+                baselines = [y_first + i * step
+                             for i in range(len(ln_texts))]
+            for y, ln in zip(baselines, ln_texts):
+                page.insert_text((b.rect.x0, y), ln, fontname=font_name,
+                                 fontsize=b.size, render_mode=3)
+
+    def _ocr_font(self, page, text: str,
+                  font_path: str | None = None) -> str:
+        """refname шрифта невидимого слоя по скрипту текста.
+
+        htmlbox (кириллица не влезает в Base-14) здесь не вариант: он
+        вставляется видимым. Не-ASCII скрипты — системный TTF со шрифа
+        -товой поддержкой (буфер), CJK — reserved имена, иначе helv."""
+        if any("\u0400" <= c <= "\u04FF" or "\u0370" <= c <= "\u03FF"
+               for c in text):
+            buf = _cyr_font_buffer(font_path)
+            page.insert_font(fontname="OcrFSil", fontbuffer=buf)
+            return "OcrFSil"
+        cjk = _cjk_font(text)
+        return cjk if cjk else "helv"
+
+
+# Порядок кандидатов: Linux → Windows → macOS. Все — регулярные начертания
+# со встроенной кириллицей.
+_CYR_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
+    "/usr/share/fonts/carlito/Carlito-Regular.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+)
+
+_cyr_buf_cache: dict[str, bytes | None] = {}
+
+
+def _cyr_font_buffer(font_path: str | None) -> bytes:
+    """Буфер TTF с кириллицей: PDF_OCR_FONT/font_path → известные пути.
+    Кэшируется: буфер читается один раз."""
+    key = font_path or ""
+    if key in _cyr_buf_cache:
+        buf = _cyr_buf_cache[key]
+    else:
+        buf = None
+        for cand in ([font_path] if font_path else
+                     list(_CYR_FONT_CANDIDATES)):
+            try:
+                buf = open(cand, "rb").read()
+                break
+            except OSError:
+                continue
+        _cyr_buf_cache[key] = buf
+    if not buf:
+        raise ValueError(
+            "Не найден системный TTF с кириллицей для невидимого "
+            "текстового слоя. Укажите шрифт через PDF_OCR_FONT "
+            "или меню OCR → Настройки.")
+    return buf

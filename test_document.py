@@ -3,9 +3,11 @@ import os
 import sys
 import tempfile
 
+import numpy as np
 import pymupdf
 
-from document import PdfDocument, _base14_key
+import ocr
+from document import OcrBlock, PdfDocument, _base14_key
 
 
 def make_pdf(path: str) -> None:
@@ -611,6 +613,132 @@ def test_save_unwritable_raises() -> None:
             raise AssertionError("ошибка не поднялась")
 
 
+# --- OCR ----------------------------------------------------------------------
+
+_OCR_ZOOM = 2.0
+
+
+def _ocr_raster() -> pymupdf.Pixmap:
+    """Растр примера страницы: два абзаца по две строки (тёмные полосы)."""
+    W, H = 595, 842
+    img = np.full((int(H * _OCR_ZOOM), int(W * _OCR_ZOOM), 3), 255,
+                  dtype=np.uint8)
+    for y_pt, lines in ((80, ["line one text", "line two text"]),
+                        (180, ["second para first", "second second"])):
+        for i, txt in enumerate(lines):
+            y0 = int((y_pt + i * 17) * _OCR_ZOOM)
+            h = int(11 * _OCR_ZOOM)
+            x1 = int(70 * _OCR_ZOOM) + int(len(txt) * 11 * 0.55 * _OCR_ZOOM)
+            img[y0:y0 + h, int(70 * _OCR_ZOOM):x1] = 0
+    return pymupdf.Pixmap(pymupdf.csRGB, img.shape[1], img.shape[0],
+                          img.tobytes(), 0)
+
+
+def _ocr_pdf(path: str) -> None:
+    """PDF, где страницы 0 и 1 — растр _ocr_raster."""
+    pix = _ocr_raster()
+    doc = pymupdf.open()
+    for _ in range(2):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, pixmap=pix)
+    doc.save(path)
+    doc.close()
+
+
+def test_ocr_detection_synthetic() -> None:
+    blocks = ocr.detect_text_blocks(_ocr_raster().samples,
+                                   _ocr_raster().width,
+                                   _ocr_raster().height, _OCR_ZOOM)
+    assert len(blocks) == 2, "две строки абзаца склеиваются в блок"
+    got = [tuple(round(v, 1) for v in b.rect) for b in blocks]
+    want = [(70.0, 80.0, 148.5, 108.0), (70.0, 180.0, 172.5, 208.0)]
+    for g, w in zip(got, want):
+        assert all(abs(a - b) <= 1.0 for a, b in zip(g, w)), f"{g} != {w}"
+        assert len(g) == 4
+    assert all(len(b.lines) == 2 for b in blocks)
+    assert 11.0 <= blocks[0].size <= 14.0, "размер строки ~11pt из высоты"
+    print("test_ocr_detection_synthetic: ok")
+
+
+class _FakeClient:
+    """Подменяет ocr.OcrClient: canned-ответы или raise."""
+    canned: dict[int, str] = {}
+    fail_all: bool = False
+    n: int = 0
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def transcribe_crop(self, png: bytes) -> str:
+        if _FakeClient.fail_all:
+            raise ocr.OcrError("fake API error")
+        _FakeClient.n += 1
+        return _FakeClient.canned.get(_FakeClient.n - 1, "")
+
+
+def _reset_fake(canned=None, fail_all: bool = False) -> None:
+    ocr.OcrClient = _FakeClient  # изоляция от сети для всех OCR-тестов
+    _FakeClient.canned = canned or {}
+    _FakeClient.fail_all = fail_all
+    _FakeClient.n = 0
+
+
+def test_ocr_apply_invisible() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        _ocr_pdf(path)
+        doc = PdfDocument(path)
+        pix = _ocr_raster()
+        _reset_fake({i: t for i, t in enumerate(
+            ["line one text\nline two text",
+             "second para first\nsecond second"])})
+        cfg = ocr.OcrConfig("http://x", "m", "k", "")
+        res = ocr.run_page_ocr(cfg, pix, _OCR_ZOOM, max_workers=1)
+        doc.apply_ocr(0, res)
+        text = doc.doc[0].get_text()
+        assert "line one text" in text and "second second" in text
+        con = doc.doc[0].read_contents()
+        assert b"3 Tr" in con, "текст невидим (render_mode=3)"
+        # GUI получает блоки через.blocks() как обычные.
+        gui = doc.blocks(0)
+        assert any("line one text" in b.text for b in gui)
+        # Кириллица — через системный буфер шрифта.
+        doc.apply_ocr(1, [OcrBlock(rect=pymupdf.Rect(70, 60, 400, 90),
+                                   text="Счёт на оплату", size=12,
+                                   lines=[pymupdf.Rect(70, 60, 400, 90)])])
+        assert "Счёт на оплату" in doc.doc[1].get_text()
+        out = os.path.join(d, "out.pdf")
+        doc.save_as(out)
+        reread = pymupdf.open(out)
+        assert "Счёт на оплату" in reread[1].get_text()
+        print("test_ocr_apply_invisible: ok")
+
+
+def test_ocr_page_abort_policy() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        _ocr_pdf(path)
+        doc = PdfDocument(path)
+        _reset_fake(fail_all=True)
+        cfg = ocr.OcrConfig("http://x", "m", "k", "")
+        try:
+            ocr.run_page_ocr(cfg, _ocr_raster(), _OCR_ZOOM, max_workers=1)
+        except ocr.OcrError:
+            pass
+        else:
+            raise AssertionError("ошибка не поднялась")
+        assert doc.blocks(0) == [], "страница не тронута при сбое"
+        print("test_ocr_page_abort_policy: ok")
+
+
+def test_ocr_clean_text() -> None:
+    assert ocr._clean_text("привет") == "привет"
+    assert ocr._clean_text("```json\nпривет\n```") == "привет"
+    assert ocr._clean_text("```\nпривет\n```") == "привет"
+    assert ocr._clean_text("  привет  ") == "привет"
+    print("test_ocr_clean_text: ok")
+
+
 if __name__ == "__main__":
     test_blocks()
     test_edit_roundtrip()
@@ -634,5 +762,9 @@ if __name__ == "__main__":
     test_htmlbox_long_line_keeps_size()
     test_save_after_undo()
     test_save_unwritable_raises()
+    test_ocr_detection_synthetic()
+    test_ocr_apply_invisible()
+    test_ocr_page_abort_policy()
+    test_ocr_clean_text()
     print("ALL OK")
     sys.exit(0)

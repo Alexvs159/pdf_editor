@@ -298,6 +298,57 @@ check("13. страница — отрисованный растр",
           and any(px < 200 for px in printed[i].get_pixmap().samples)
           for i in (0, 1)))
 
+# --- 15. OCR: диалог настроек и запуск с fake-провайдером
+import ocr
+import window as _window
+from window import OcrSettingsDialog
+
+cfg15 = ocr.OcrConfig("http://fake", "fake-model", "fake-key", "")
+dlg15 = OcrSettingsDialog(cfg15)
+check("15. диалог настроек заполнен из конфига", dlg15.config() == cfg15)
+
+
+class _FakeOcr:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def transcribe_crop(self, png: bytes) -> str:
+        return "OCR fake text"
+
+
+ocr.OcrClient = _FakeOcr
+_orig_load = _window.load_ocr_config
+_window.load_ocr_config = lambda: cfg15
+_orig_question, _orig_info, _orig_crit = (
+    QMessageBox.question, QMessageBox.information, QMessageBox.critical)
+QMessageBox.question = staticmethod(
+    lambda *a, **k: QMessageBox.StandardButton.Yes)
+QMessageBox.information = staticmethod(
+    lambda *a, **k: QMessageBox.StandardButton.Ok)
+QMessageBox.critical = staticmethod(
+    lambda *a, **k: QMessageBox.StandardButton.Ok)
+
+WIN.thumbs.setCurrentRow(0)
+WIN.run_ocr([0])
+w15 = WIN.ocr_worker
+check("15. OCR-воркер запущен, действия disabled",
+      w15 is not None and not WIN.act_ocr_page.isEnabled())
+w15.wait()
+QApplication.processEvents()
+check("15. OCR завершён, воркер освобождён", WIN.ocr_worker is None)
+check("15. блоки OCR вставлены",
+      any("OCR fake text" in b.text for b in WIN.blocks))
+check("15. страница помечена как изменённая", WIN._dirty is True)
+check("15. действия OCR включены снова", WIN.act_ocr_page.isEnabled())
+WIN.undo()
+check("15. undo убирает OCR-слой",
+      not any("OCR fake text" in b.text for b in WIN.blocks))
+
+QMessageBox.question = _orig_question
+QMessageBox.information = _orig_info
+QMessageBox.critical = _orig_crit
+_window.load_ocr_config = _orig_load
+
 # --- 14. GTK-шум платформенной темы Qt подавлен (_quiet_gtk_log)
 import ctypes
 import main as _main

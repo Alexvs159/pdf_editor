@@ -6,21 +6,24 @@ in-place редактор (QGraphicsTextItem). Панель шрифта/раз�
 """
 import os
 
-from PyQt6.QtCore import QRectF, QSize, Qt, QTimer
+from PyQt6.QtCore import (
+    QRectF, QSettings, QSize, Qt, QThread, QTimer, pyqtSignal,
+)
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
     QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QGraphicsRectItem, QGraphicsScene, QGraphicsTextItem,
-    QGraphicsView, QSplitter, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QPushButton, QGraphicsRectItem, QGraphicsScene,
+    QGraphicsTextItem, QGraphicsView, QSplitter, QVBoxLayout, QWidget,
 )
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 
 import pymupdf
 
+import ocr
 from document import PdfDocument, _base14_key, _clean_font_name
 
 THUMB_W = 120
@@ -55,6 +58,24 @@ def pixmap_to_qimage(pix: pymupdf.Pixmap) -> QImage:
                   QImage.Format.Format_RGB888)
 
 
+_OCR_SETTINGS = ("pdf_editor", "pdf_editor-ocr")
+
+
+def load_ocr_config() -> ocr.OcrConfig:
+    """Настройки OCR: env-дефолты, перекрытые сохранёнными в QSettings."""
+    env = ocr.config_from_env()
+    s = QSettings(*_OCR_SETTINGS)
+
+    def pick(key: str, default: str) -> str:
+        val = s.value(key, "")
+        return str(val) if val else default
+
+    return ocr.OcrConfig(pick("base_url", env.base_url),
+                         pick("model", env.model),
+                         pick("api_key", env.api_key),
+                         pick("font_path", env.font_path))
+
+
 class BlockItem(QGraphicsRectItem):
     """Рамка блока: выделение/перетаскивание, двойной клик — правка in-place."""
 
@@ -84,6 +105,74 @@ class BlockItem(QGraphicsRectItem):
         QTimer.singleShot(0, lambda: self.win.commit_move(idx, rect))
 
 
+class OcrSettingsDialog(QDialog):
+    """base_url/модель/ключ/шрифт. Дефолты — env, хранение — QSettings."""
+
+    def __init__(self, cfg: ocr.OcrConfig, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройки OCR")
+        lay = QVBoxLayout(self)
+        self.base_url = QLineEdit(cfg.base_url)
+        self.base_url.setPlaceholderText("https://api.openai.com/v1")
+        self.model = QLineEdit(cfg.model)
+        self.model.setPlaceholderText("vision-модель, например gpt-4o-mini")
+        self.key = QLineEdit(cfg.api_key)
+        self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.setToolTip(
+            "Ключ хранится в QSettings в открытом виде (локальный инструмент).")
+        self.font_path = QLineEdit(cfg.font_path)
+        self.font_path.setPlaceholderText(
+            "TTF с кириллицей для текстового слоя (пусто — системный поиск)")
+        for label, w in (("Base URL", self.base_url), ("Модель", self.model),
+                         ("Ключ API", self.key),
+                         ("TTF для кириллицы", self.font_path)):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(w, 1)
+            lay.addLayout(row)
+        btns = QHBoxLayout()
+        ok = QPushButton("Сохранить")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Отмена")
+        cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+    def config(self) -> ocr.OcrConfig:
+        return ocr.OcrConfig(self.base_url.text().strip().rstrip("/"),
+                             self.model.text().strip(),
+                             self.key.text().strip(),
+                             self.font_path.text().strip())
+
+
+class OcrWorker(QThread):
+    """Транскрипция подготовленных растров страниц вне главного потока.
+    Результат применяется только целиком: сбой → failed, вставок нет."""
+
+    progress = pyqtSignal(int, int)  # готово страниц, всего
+    ok = pyqtSignal(list)            # [(индекс страницы, [OcrBlock])]
+    failed = pyqtSignal(str)
+
+    def __init__(self, cfg: ocr.OcrConfig, pages: list[tuple[int, pymupdf.Pixmap]]):
+        super().__init__()
+        self.cfg = cfg
+        self.pages = pages
+
+    def run(self) -> None:
+        try:
+            out = []
+            for n, (idx, pix) in enumerate(self.pages):
+                blocks = ocr.run_page_ocr(self.cfg, pix, VIEW_ZOOM)
+                if blocks:
+                    out.append((idx, blocks))
+                self.progress.emit(n + 1, len(self.pages))
+            self.ok.emit(out)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, pdf_path: str | None = None):
         super().__init__()
@@ -93,6 +182,8 @@ class MainWindow(QMainWindow):
         self.selected = -1
         self._undo_stack = []
         self._dirty = False                            # есть несохранённые правки
+        self.ocr_worker: OcrWorker | None = None       # OCR в фоне
+        self._ocr_cfg: ocr.OcrConfig | None = None     # настройки запуска
         self.overlay: QGraphicsTextItem | None = None  # in-place редактор
         self.overlay_bg = None                         # белая подложка под ним
         self.overlay_idx = None                        # блок, который правим
@@ -175,6 +266,20 @@ class MainWindow(QMainWindow):
         menu.addAction(act_open)
         menu.addAction(act_save)
         menu.addAction(act_print)
+
+        menu_ocr = self.menuBar().addMenu("&OCR")
+        self.act_ocr_page = QAction("OCR &страницы…", self)
+        self.act_ocr_page.triggered.connect(self.ocr_page)
+        self.act_ocr_doc = QAction("OCR весь &документ…", self)
+        self.act_ocr_doc.triggered.connect(self.ocr_document)
+        self.act_ocr_settings = QAction("&Настройки OCR…", self)
+        self.act_ocr_settings.triggered.connect(self.edit_ocr_settings)
+        self._ocr_actions = [self.act_ocr_page, self.act_ocr_doc,
+                             self.act_ocr_settings]
+        menu_ocr.addAction(self.act_ocr_page)
+        menu_ocr.addAction(self.act_ocr_doc)
+        menu_ocr.addSeparator()
+        menu_ocr.addAction(self.act_ocr_settings)
 
         if pdf_path:
             self.open_pdf(pdf_path)
@@ -292,6 +397,117 @@ class MainWindow(QMainWindow):
         for w in (self.font_combo, self.size_auto, self.size_spin,
                   self.apply_btn, self.cancel_btn):
             w.setEnabled(on)
+
+    # -- OCR --------------------------------------------------------------
+    def edit_ocr_settings(self) -> None:
+        dlg = OcrSettingsDialog(load_ocr_config(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cfg = dlg.config()
+        s = QSettings(*_OCR_SETTINGS)
+        for key, val in (("base_url", cfg.base_url), ("model", cfg.model),
+                         ("api_key", cfg.api_key),
+                         ("font_path", cfg.font_path)):
+            s.setValue(key, val)
+        s.sync()
+
+    def ocr_page(self) -> None:
+        if self.doc and self.page_idx >= 0:
+            self.run_ocr([self.page_idx])
+
+    def ocr_document(self) -> None:
+        if self.doc:
+            self.run_ocr(list(range(self.doc.page_count)))
+
+    def run_ocr(self, pages: list[int]) -> None:
+        """Растры выбранных страниц → фоновый воркер; вставка только при
+        успехе ВСЕХ страниц (политика «прервать всё»)."""
+        if not self.doc or self.ocr_worker is not None or not pages:
+            return
+        cfg = load_ocr_config()
+        if not cfg.configured():
+            QMessageBox.warning(self, "OCR",
+                                "Не заданы base_url, модель или ключ API.\n"
+                                "Открою настройки OCR.")
+            self.edit_ocr_settings()
+            return
+        # shortcut: повёрнутые страницы пропускаем — текст вставился бы
+        # вместе с поворотом страницы; апгрейд — пересчёт через матрицу.
+        rotated = [i for i in pages if self.doc.doc[i].rotation % 360]
+        pages = [i for i in pages if i not in rotated]
+        if rotated:
+            QMessageBox.warning(self, "OCR",
+                                "Пропущены повёрнутые страницы: "
+                                + ", ".join(str(i + 1) for i in rotated))
+        if not pages:
+            return
+        with_text = [i for i in pages
+                     if self.doc.doc[i].get_text().strip()]
+        if with_text:
+            reply = QMessageBox.question(
+                self, "OCR",
+                "На страницах уже есть текстовый слой: "
+                + ", ".join(str(i + 1) for i in with_text)
+                + ". Добавить ещё один?")
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        pixmaps = [(i, self.doc.page_pixmap(i, zoom=VIEW_ZOOM))
+                   for i in pages]
+        self._ocr_cfg = cfg
+        self.ocr_worker = OcrWorker(cfg, pixmaps)
+        self.ocr_worker.progress.connect(self._ocr_progress)
+        self.ocr_worker.ok.connect(self._ocr_done)
+        self.ocr_worker.failed.connect(self._ocr_failed)
+        for a in self._ocr_actions:
+            a.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        self.statusBar().showMessage(f"OCR: 0/{len(pixmaps)}")
+        self.ocr_worker.start()
+
+    def _ocr_progress(self, done: int, total: int) -> None:
+        self.statusBar().showMessage(f"OCR: {done}/{total}")
+
+    def _ocr_done(self, results: list) -> None:
+        self._ocr_finish()
+        if not results:
+            QMessageBox.information(self, "OCR",
+                                    "Текст на страницах не найден.")
+            return
+        self._snapshot()
+        try:
+            for idx, blocks in results:
+                self.doc.apply_ocr(idx, blocks,
+                                   font_path=self._ocr_cfg.font_path)
+        except Exception as e:
+            self.undo()  # откат к снимку до вставки
+            QMessageBox.critical(self, "OCR",
+                                 f"Не удалось вставить текст:\n{e}")
+            return
+        self._dirty = True
+        self.select_page(self.page_idx)
+        self.thumbs.blockSignals(True)
+        for idx, _blocks in results:
+            item = self.thumbs.item(idx)
+            if item is not None:
+                item.setIcon(QIcon(QPixmap.fromImage(pixmap_to_qimage(
+                    self.doc.thumbnail_pixmap(idx)))))
+        self.thumbs.blockSignals(False)
+        total = sum(len(b) for _i, b in results)
+        self.info.setText(f"OCR: добавлено блоков {total} (Ctrl+Z — отменить)")
+
+    def _ocr_failed(self, msg: str) -> None:
+        self._ocr_finish()
+        QMessageBox.critical(self, "OCR",
+                             f"OCR прерван, изменений нет:\n{msg}")
+
+    def _ocr_finish(self) -> None:
+        w, self.ocr_worker = self.ocr_worker, None
+        if w is not None:
+            w.wait()
+        for a in self._ocr_actions:
+            a.setEnabled(True)
+        QApplication.restoreOverrideCursor()
+        self.statusBar().clearMessage()
 
     # -- страницы и блоки -------------------------------------------------
     def select_page(self, row: int) -> None:

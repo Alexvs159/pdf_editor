@@ -90,12 +90,11 @@ class BlockItem(QGraphicsRectItem):
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu()
-        act = menu.addAction("Копировать текст",
-                             lambda: self.win.copy_block_text(self.data(0)))
-        exec = menu.exec(event.globalScreenPos() if hasattr(event, "globalScreenPos")
-                         else event.globalPos())
-        if exec == act:
-            event.accept()
+        idx = self.data(0)
+        menu.addAction("Копировать", lambda: self.win.copy_block_text(idx))
+        menu.addAction("Вырезать", lambda: self.win.cut_block_text(idx))
+        menu.addAction("Удалить", lambda: self.win.delete_block_text(idx))
+        menu.exec(event.globalPos())
 
     def mousePressEvent(self, event) -> None:
         self._press = self.pos()
@@ -262,6 +261,11 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Escape"), self, self.cancel_edit)
         QShortcut(QKeySequence("Ctrl+S"), self, self.prompt_save)
         QShortcut(QKeySequence("Ctrl+P"), self, self.print_pages)
+        # Ctrl+C копирует текст выделенного блока; на время работы in-place
+        # редактора выключается — иначе «съедает» копирование выделения
+        # внутри оверлея.
+        self.copy_sc = QShortcut(QKeySequence("Ctrl+C"), self, self._copy_selected)
+        self.copy_sc.setEnabled(False)
 
         menu = self.menuBar().addMenu("&Файл")
         act_open = QAction("&Открыть…", self)
@@ -571,6 +575,22 @@ class MainWindow(QMainWindow):
         if 0 <= idx < len(self.blocks):
             QApplication.clipboard().setText(self.blocks[idx].text)
 
+    def _copy_selected(self) -> None:
+        items = [it for it in self.scene.selectedItems() if isinstance(it, BlockItem)]
+        if items:
+            self.copy_block_text(items[0].data(0))
+
+    def cut_block_text(self, idx: int) -> None:
+        """Копировать текст блока и удалить его (undo — Ctrl+Z)."""
+        self.copy_block_text(idx)
+        self.delete_block_text(idx)
+
+    def delete_block_text(self, idx: int) -> None:
+        """Удалить текст блока — та же правка через модель (undo — Ctrl+Z)."""
+        if 0 <= idx < len(self.blocks):
+            self._submit(self.blocks[idx], "", None)
+            self.selected = None
+
     def start_edit(self, item: BlockItem) -> None:
         if not self.doc or not self.blocks:
             return
@@ -604,6 +624,7 @@ class MainWindow(QMainWindow):
         t.document().contentsChanged.connect(self._fit_overlay_bg)
         self._fit_overlay_bg()
         t.setFocus()
+        self.copy_sc.setEnabled(False)  # оверлей открыт — Ctrl+C работает в нём
 
     def _fit_overlay_bg(self) -> None:
         """Подложка растёт вместе с текстом по горизонтали и вертикали."""
@@ -624,6 +645,7 @@ class MainWindow(QMainWindow):
             self.scene.removeItem(bg)
         if t is not None:
             self.scene.removeItem(t)
+        self.copy_sc.setEnabled(True)  # Ctrl+C снова копирует блок
 
     def scene_rect(self, item: BlockItem) -> pymupdf.Rect:
         """Rect рамки в координатах PDF (сцена масштабирована VIEW_ZOOM)."""

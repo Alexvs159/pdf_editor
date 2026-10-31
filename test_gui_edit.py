@@ -405,6 +405,38 @@ check("16. «Копировать текст» кладёт текст ячей�
       QApplication.clipboard().text() == "Cell B2")
 WT.close()
 
+# --- 17. Ctrl+C на выделенном блоке; Копировать/Вырезать/Удалить
+item17 = next(it for it in WIN.scene.items()
+              if isinstance(it, BlockItem) and it.data(0) < len(WIN.blocks))
+item17.setSelected(True)
+WIN.on_block_selected()
+QApplication.clipboard().setText("")
+WIN._copy_selected()
+check("17. Ctrl+C копирует текст выделенного блока",
+      QApplication.clipboard().text() == WIN.blocks[item17.data(0)].text)
+
+WIN.start_edit(item17)
+check("17. при открытом редакторе Ctrl+C выключен", not WIN.copy_sc.isEnabled())
+WIN.cancel_edit()
+check("17. после отмены Ctrl+C включён", WIN.copy_sc.isEnabled())
+
+t17 = WIN.blocks[item17.data(0)].text
+idx17 = item17.data(0)
+WIN.cut_block_text(idx17)
+check("17. вырезать: текст в буфере", QApplication.clipboard().text() == t17)
+check("17. вырезать: текст блока удалён",
+      not any(b.text == t17 for b in WIN.blocks))
+WIN.undo()
+check("17. undo восстановил после вырезания",
+      any(b.text == t17 for b in WIN.blocks))
+
+WIN.delete_block_text(idx17)
+check("17. удалить: текст блока исчез",
+      not any(b.text == t17 for b in WIN.blocks))
+WIN.undo()
+check("17. undo восстановил после удаления",
+      any(b.text == t17 for b in WIN.blocks))
+
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 WIN.close()  # closeEvent покажет подтверждение несохранённых правок

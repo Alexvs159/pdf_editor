@@ -569,10 +569,12 @@ class MainWindow(QMainWindow):
             rect, pen=QPen(Qt.PenStyle.NoPen), brush=QColor(255, 255, 255))
         t = QGraphicsTextItem()
         # shortcut: гарнитура оверлея приблизительная (QFont по очищенному
-        # имени, встроенный TTF в Qt не загружается, кегль — эмпирический
-        # пересчёт); точный шрифт/размер применяет модель при вставке.
+        # имени, встроенный TTF в Qt не загружается); точный шрифт/размер
+        # применяет модель при вставке. Кегль — pixelSize = кегль блока:
+        # 1px оверлея = 1 scene-юнит = 1 пункт страницы, текст ложится
+        # точно на исходный при любом zoom и DPI.
         f = QFont(_clean_font_name(b.font))
-        f.setPointSizeF(max(4.0, b.size * VIEW_ZOOM * 0.75))
+        f.setPixelSize(max(1, round(b.size)))
         t.setFont(f)
         t.setDefaultTextColor(QColor(0, 0, 0))
         t.setPlainText(b.text)

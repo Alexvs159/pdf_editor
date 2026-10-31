@@ -717,6 +717,62 @@ def test_ocr_apply_invisible() -> None:
         print("test_ocr_apply_invisible: ok")
 
 
+def test_invisible_layer_flag() -> None:
+    """Блоки невидимого слоя распознаются по char_flags; видимый текст — нет."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        doc = pymupdf.open()
+        pg = doc.new_page(width=200, height=120)
+        pg.insert_text((20, 40), "visible normal", fontname="helv", fontsize=12)
+        pg.insert_text((20, 90), "invisible ocr", fontname="helv", fontsize=12,
+                       render_mode=3)
+        doc.save(path)
+        doc.close()
+        doc = PdfDocument(path)
+        blocks = doc.blocks(0)
+        by_text = {b.text: b for b in blocks}
+        assert by_text["visible normal"].invisible is False
+        assert by_text["invisible ocr"].invisible is True
+        print("test_invisible_layer_flag: ok")
+
+
+def test_ocr_edit_clears_raster() -> None:
+    """Правка блока невидимого слоя затирает растровый текст под блоком,
+    остальное изображение и соседние картинки не трогаются."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        doc = pymupdf.open()
+        pg = doc.new_page(width=200, height=120)
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 100, 40))
+        pix.set_rect(pix.irect, (200, 30, 30))  # "фон" — красная плашка
+        pg.insert_image(pymupdf.Rect(20, 20, 120, 60), pixmap=pix)
+        pg.insert_text((25, 50), "raster text", fontname="helv", fontsize=10,
+                       render_mode=3)
+        doc.save(path)
+        doc.close()
+
+        doc = PdfDocument(path)
+        block = doc.blocks(0)[0]
+        assert block.invisible, "блок OCR-слоя должен считаться невидимым"
+        doc.set_text(0, block, "replaced text")
+        pg = doc.doc[0]
+        # Новый текст видим (не невидимый слой).
+        spans = [s for b in pg.get_text("dict")["blocks"] if b["type"] == 0
+                 for l in b["lines"] for s in l["spans"]]
+        assert any("replaced text" in s["text"] and s["char_flags"] != 0
+                   for s in spans)
+        # Растр в зоне блока очищен, вне зоны картинка цела.
+        r = pg.get_pixmap()
+        def px(x: float, y: float) -> tuple:
+            return tuple(r.pixel(int(x), int(y))[:3])
+        bbox = block.rect
+        assert px((bbox.x0 + bbox.x1) / 2, bbox.y0 + 2) != (200, 30, 30), \
+            "растровый текст не затёрт"
+        assert px(bbox.x1 + 10, (bbox.y0 + bbox.y1) / 2) == (200, 30, 30), \
+            "соседняя область картинки пострадала"
+        print("test_ocr_edit_clears_raster: ok")
+
+
 def test_ocr_page_abort_policy() -> None:
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "t.pdf")
@@ -830,6 +886,8 @@ if __name__ == "__main__":
     test_ocr_detection_synthetic()
     test_ocr_apply_invisible()
     test_ocr_page_abort_policy()
+    test_invisible_layer_flag()
+    test_ocr_edit_clears_raster()
     test_ocr_clean_text()
     test_ocr_parse_reply()
     test_ocr_style_mapping()

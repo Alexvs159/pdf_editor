@@ -19,6 +19,9 @@ class TextBlock:
     # единственный источник стиля (в том числе смешения внутри строки).
     # None = не извлекалось (TextBlock создан вручную).
     line_runs: list[list[dict]] | None = None
+    # Все спаны блока невидимы (render_mode 3): типично текстовый слой OCR
+    # поверх растра. Такие блоки при правке дополнительно затирают растр.
+    invisible: bool = False
 
     @property
     def line_styles(self) -> list[dict]:
@@ -189,6 +192,10 @@ class PdfDocument:
             if b["type"] != 0:
                 continue
             line_runs = []
+            # Невидимый спан: ни filled, ни stroked (char_flags бит 3 и 4) —
+            # так вставляется текстовый слой OCR (render_mode 3).
+            invisible = all((s["char_flags"] & 0b11000) == 0
+                            for line in b["lines"] for s in line["spans"])
             for line in b["lines"]:
                 runs = []
                 for s in line["spans"]:
@@ -217,6 +224,7 @@ class PdfDocument:
                 size=first["size"],
                 color=first["color"],
                 line_runs=line_runs,
+                invisible=invisible,
             ))
         return out
 
@@ -261,10 +269,16 @@ class PdfDocument:
         page = self.doc[idx]
         # Буферы шрифтов — до красакта (см. _page_font_buffers).
         font_buffers = self._page_font_buffers(page)
-        # Redaction всегда по исходному прямоугольнику блока.
-        page.add_redact_annot(block.rect, fill=False)
+        # Redaction всегда по исходному прямоугольнику блока. Для блоков
+        # невидимого слоя (текстовый слой OCR поверх растра) дополнительно
+        # затираем пиксели изображений под блоком — иначе растровый текст
+        # остаётся позади и новый текст задваивается. Растр очищается только
+        # в области блока, соседние изображения не трогаются.
+        raster = block.invisible
+        page.add_redact_annot(block.rect, fill=(1, 1, 1) if raster else False)
         page.apply_redactions(
-            images=pymupdf.PDF_REDACT_IMAGE_NONE,
+            images=(pymupdf.PDF_REDACT_IMAGE_PIXELS if raster
+                    else pymupdf.PDF_REDACT_IMAGE_NONE),
             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
         )
         if not new_text:

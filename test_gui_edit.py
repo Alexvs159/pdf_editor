@@ -77,6 +77,11 @@ check("2. текст оверлея = block.text",
 pos_ok = abs(ov.pos().x() - orig.rect.x0 * 2.0) < 1 and abs(ov.pos().y() - orig.rect.y0 * 2.0) < 1
 check("2. оверлей на месте блока", pos_ok)
 check("2. фокус в оверлее", WIN.scene.focusItem() is ov)
+# Кегль оверлея = кегль блока: em в элементных px = пункту страницы,
+# иначе редактор «раздувает» текст относительно страницы.
+fpx = ov.font().pixelSize()
+check("2. кегль оверлея = кеглю блока",
+      fpx == max(1, round(orig.size)) and fpx < round(orig.size * 1.5))
 
 # --- 2b. одиночный клик — панель появляется при выделении
 sel_item = find_block(t0.split("\n")[0][:10])

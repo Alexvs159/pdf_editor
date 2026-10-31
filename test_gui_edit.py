@@ -405,6 +405,32 @@ check("16. «Копировать текст» кладёт текст ячей�
       QApplication.clipboard().text() == "Cell B2")
 WT.close()
 
+# --- 18. дабл клик: оверлей реальной гарнитурой и кеглем 1:1
+_ef = pymupdf.open()
+_ep = _ef.new_page()
+_ep.insert_font(fontname="dj", fontfile="/usr/share/fonts/TTF/DejaVuSans.ttf")
+_ep.insert_text((72, 100), "Exact face preview", fontname="dj", fontsize=12)
+_ef.save(FONTPDF := os.path.join(os.path.dirname(SAMPLE), "font.pdf"))
+_ef.close()
+WF = _window.MainWindow(pdf_path=FONTPDF)
+WF.resize(1280, 860)
+_fitem = next(it for it in WF.scene.items()
+              if isinstance(it, BlockItem) and it.data(0) == 0)
+WF.start_edit(_fitem)
+check("18. оверлей встроенным TTF (точная гарнитура)",
+      WF.overlay is not None and WF.overlay.font().family() == "DejaVu Sans")
+check("18. кегль точно как в блоке",
+      WF.overlay.font().pixelSize() == round(WF.blocks[0].size))
+WF.cancel_edit()
+# Base-14: буфера нет — остаётся подмена по имени, кегль всё равно точен
+_hitem = next(it for it in WIN.scene.items() if isinstance(it, BlockItem)
+              and it.data(0) == 0)
+WIN.start_edit(_hitem)
+check("18. кегль оверлея Base-14 тоже 1:1",
+      WIN.overlay is not None
+      and WIN.overlay.font().pixelSize() == round(WIN.blocks[0].size))
+WIN.cancel_edit()
+
 # --- 17. Ctrl+C на выделенном блоке; Копировать/Вырезать/Удалить
 item17 = next(it for it in WIN.scene.items()
               if isinstance(it, BlockItem) and it.data(0) < len(WIN.blocks))

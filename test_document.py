@@ -717,6 +717,28 @@ def test_ocr_apply_invisible() -> None:
         print("test_ocr_apply_invisible: ok")
 
 
+def test_embedded_font_buffer() -> None:
+    """Буфер встроенного TTF извлекается по имени спана; у Base-14 его нет."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        doc = pymupdf.open()
+        pg = doc.new_page()
+        pg.insert_font(fontname="dj", fontfile="/usr/share/fonts/TTF/DejaVuSans.ttf")
+        pg.insert_text((72, 100), "DejaVu embedded", fontname="dj", fontsize=12)
+        pg.insert_text((72, 130), "Base14 helv", fontname="helv", fontsize=12)
+        doc.save(path)
+        doc.close()
+
+        doc = PdfDocument(path)
+        blocks = doc.blocks(0)
+        by_text = {b.text: b for b in blocks}
+        buf = doc.embedded_font_buffer(0, by_text["DejaVu embedded"].font)
+        assert buf and len(buf) > 1000, "буфер встроенного TTF не извлекли"
+        assert doc.embedded_font_buffer(0, by_text["Base14 helv"].font) is None, \
+            "у Base-14 не должно быть буфера"
+        print("test_embedded_font_buffer: ok")
+
+
 def test_table_blocks_split() -> None:
     """Блоки таблицы разбиваются по ячейкам; обычный текст не трогается."""
     with tempfile.TemporaryDirectory() as d:
@@ -925,6 +947,7 @@ if __name__ == "__main__":
     test_invisible_layer_flag()
     test_ocr_edit_clears_raster()
     test_table_blocks_split()
+    test_embedded_font_buffer()
     test_ocr_clean_text()
     test_ocr_parse_reply()
     test_ocr_style_mapping()

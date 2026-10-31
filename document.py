@@ -282,6 +282,30 @@ class PdfDocument:
                     out.append(name)
         return out
 
+    def embedded_font_buffer(self, page: int, font_name: str) -> bytes | None:
+        """Буфер встроенного шрифта по имени спана (для предпросмотра
+        in-place оверлея GUI: точная гарнитура через QFontDatabase).
+        Base-14 (ext == n/a) буфера не имеют — None, Qt подменит по имени."""
+        if not font_name:
+            return None
+        want = _clean_font_name(font_name).lower().replace(" ", "")
+        if not want:
+            return None
+        for row in self.doc[page].get_fonts(full=True):
+            base = _clean_font_name(row[3]).lower().replace(" ", "")
+            # имя спана и BaseFont совпадают без пробелов
+            # (alias "CharisSIL" — префикс "Charis SIL Bold")
+            if want in base or base in want:
+                if row[1] == "n/a":
+                    break  # Base-14: буфера нет
+                try:
+                    _n, _e, _t, buf = self.doc.extract_font(row[0])
+                except Exception:
+                    return None
+                if buf:
+                    return buf
+        return None
+
     def _page_font_buffers(self, page) -> dict[str, bytes]:
         """Буферы встроенных шрифтов страницы. Снимок ДО redaction:
         MuPDF может удалить ресурс шрифта, если красактом вырезан весь

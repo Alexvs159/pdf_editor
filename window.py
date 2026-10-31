@@ -10,8 +10,8 @@ from PyQt6.QtCore import (
     QRectF, QSettings, QSize, Qt, QThread, QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap,
-    QShortcut,
+    QAction, QColor, QFont, QFontDatabase, QIcon, QImage, QKeySequence, QPainter,
+    QPen, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
@@ -194,6 +194,7 @@ class MainWindow(QMainWindow):
         self.ocr_worker: OcrWorker | None = None       # OCR в фоне
         self._ocr_cfg: ocr.OcrConfig | None = None     # настройки запуска
         self.overlay: QGraphicsTextItem | None = None  # in-place редактор
+        self._fam_cache: dict[str, str] | None = None  # имя шрифта → семья Qt
         self.overlay_bg = None                         # белая подложка под ним
         self.overlay_idx = None                        # блок, который правим
         self.edit_rect = None                          # исходный rect блока
@@ -590,6 +591,26 @@ class MainWindow(QMainWindow):
             self._submit(self.blocks[idx], "", None)
             self.selected = None
 
+    def _qt_family(self, font_name: str) -> str:
+        """Семейство Qt для шрифта блока: буфер встроенного TTF/OTF
+        загружается через QFontDatabase (кэш — одна загрузка на шрифт).
+        Пустая строка — подмена по имени (Base-14 или сбой загрузки)."""
+        if self._fam_cache is None:
+            self._fam_cache = {}
+        key = _clean_font_name(font_name).lower()
+        if key in self._fam_cache:
+            return self._fam_cache[key]
+        fam = ""
+        buf = (self.doc.embedded_font_buffer(self.page_idx, font_name)
+               if self.doc else None)
+        if buf:
+            fid = QFontDatabase.addApplicationFontFromData(buf)
+            fams = QFontDatabase.applicationFontFamilies(fid)
+            if fams:
+                fam = fams[0]
+        self._fam_cache[key] = fam
+        return fam
+
     def start_edit(self, item: BlockItem) -> None:
         if not self.doc or not self.blocks:
             return
@@ -602,12 +623,12 @@ class MainWindow(QMainWindow):
         self.overlay_bg = self.scene.addRect(
             rect, pen=QPen(Qt.PenStyle.NoPen), brush=QColor(255, 255, 255))
         t = QGraphicsTextItem()
-        # shortcut: гарнитура оверлея приблизительная (QFont по очищенному
-        # имени, встроенный TTF в Qt не загружается); точный шрифт/размер
-        # применяет модель при вставке. Кегль — pixelSize = кегль блока:
-        # 1px оверлея = 1 scene-юнит = 1 пункт страницы, текст ложится
-        # точно на исходный при любом zoom и DPI.
-        f = QFont(_clean_font_name(b.font))
+        # Гарнитура оверлея: встроенный TTF/OTF шрифта блока грузится через
+        # QFontDatabase — точная гарнитура и пропорции, кегль 1:1 с блоком
+        # (1px = 1 пункт страницы при любом zoom и DPI). Base-14 буфера не
+        # имеют — подмена Qt по имени (кегль всё равно точен).
+        fam = self._qt_family(b.font)
+        f = QFont(fam) if fam else QFont(_clean_font_name(b.font))
         f.setPixelSize(max(1, round(b.size)))
         t.setFont(f)
         t.setDefaultTextColor(QColor(0, 0, 0))

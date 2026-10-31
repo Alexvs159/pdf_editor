@@ -91,8 +91,9 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
     вызывается из контекстного меню рамки (`BlockItem.contextMenuEvent`:
     Копировать / Вырезать / Удалить) и по `Ctrl+C` на выделенном блоке
     (`_copy_selected`; хоткей выключен, пока открыт in-place редактор —
-    иначе «съедает» копирование выделения внутри оверлея, вкл/вкл в
-    `start_edit`/`cancel_edit`). `cut_block_text` — копировать + удалить;
+    иначе «съедает» копирование выделения внутри оверлея; вкл/вкл в
+    `start_edit`/`cancel_edit`/`_submit`; создаётся ВКЛЮЧЁННЫМ, иначе
+    Ctrl+C не работал до первого открытия редактора). `cut_block_text` — копировать + удалить;
     `delete_block_text` — удаление текста блока через `_submit(b, "")`
     (undo работает, для невидимого слоя растр тоже затирается).
   - `print_pages` — печать через системный диалог: ввод страниц
@@ -343,6 +344,9 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
 - pymupdf 2.0: у `Page.insert_text` НЕТ параметра `fontbuffer` — сначала
   `page.insert_font(fontname=..., fontbuffer=...)`, затем `insert_text(fontname=ref)`.
   `Pixmap(cs, w, h, samples, alpha)` — аргументы позиционные (kwargs не принимает).
+- PyQt6: у `QGraphicsSceneContextMenuEvent` НЕТ `globalPos()` — меню
+  блока роняло приложение (SIGABRT из Qt-слота); использовать
+  `event.screenPos()`.
 - Невидимый текст: `insert_text(render_mode=3)`; проверка в тесте —
   `b"3 Tr" in page.read_contents()`. htmlbox невидимым не бывает.
 - «Текст на скане не копируется после OCR» — кириллица в Base-14 не

@@ -16,8 +16,9 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QGraphicsRectItem, QGraphicsScene,
-    QGraphicsTextItem, QGraphicsView, QSplitter, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QGraphicsRectItem,
+    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QSplitter, QVBoxLayout,
+    QWidget,
 )
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 
@@ -86,6 +87,15 @@ class BlockItem(QGraphicsRectItem):
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.win.start_edit(self)
+
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu()
+        act = menu.addAction("Копировать текст",
+                             lambda: self.win.copy_block_text(self.data(0)))
+        exec = menu.exec(event.globalScreenPos() if hasattr(event, "globalScreenPos")
+                         else event.globalPos())
+        if exec == act:
+            event.accept()
 
     def mousePressEvent(self, event) -> None:
         self._press = self.pos()
@@ -556,6 +566,11 @@ class MainWindow(QMainWindow):
         self.set_block_controls_enabled(True)
 
     # -- правка in-place --------------------------------------------------
+    def copy_block_text(self, idx: int) -> None:
+        """Текст блока (в т.ч. ячейки таблицы) в буфер обмена."""
+        if 0 <= idx < len(self.blocks):
+            QApplication.clipboard().setText(self.blocks[idx].text)
+
     def start_edit(self, item: BlockItem) -> None:
         if not self.doc or not self.blocks:
             return

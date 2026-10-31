@@ -717,6 +717,42 @@ def test_ocr_apply_invisible() -> None:
         print("test_ocr_apply_invisible: ok")
 
 
+def test_table_blocks_split() -> None:
+    """Блоки таблицы разбиваются по ячейкам; обычный текст не трогается."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        doc = pymupdf.open()
+        pg = doc.new_page(width=300, height=200)
+        # Сетка таблицы 2x2 линиями.
+        for y in (30, 60, 90):
+            pg.draw_line((30, y), (270, y), color=(0, 0, 0), width=1)
+        for x in (30, 150, 270):
+            pg.draw_line((x, 30), (x, 90), color=(0, 0, 0), width=1)
+        for cx, cy, txt in [(55, 50, "Cell A1"), (175, 50, "Cell A2"),
+                            (55, 80, "Cell B1"), (175, 80, "Cell B2")]:
+            pg.insert_text((cx, cy), txt, fontname="helv", fontsize=10)
+        # Обычный текст вне таблицы (две строки одним блоком).
+        pg.insert_textbox(pymupdf.Rect(30, 120, 270, 170),
+                          "Plain paragraph line one and "
+                          "plain paragraph line two continues",
+                          fontname="helv", fontsize=10)
+        doc.save(path)
+        doc.close()
+
+        doc = PdfDocument(path)
+        blocks = doc.blocks(0)
+        texts = {b.text for b in blocks}
+        for cell in ("Cell A1", "Cell A2", "Cell B1", "Cell B2"):
+            assert cell in texts, f"ячейка {cell} не выделена отдельным блоком"
+        # Ни один блок не склеивает несколько ячеек.
+        assert not any(b.text != c and c in b.text
+                       for b in blocks for c in ("Cell A1", "Cell A2"))
+        # Обычный абзац остался целым блоком (не порезан по «ячейкам»).
+        para = [b for b in blocks if "Plain paragraph" in b.text]
+        assert para and para[0].text.count("\n") >= 1
+        print("test_table_blocks_split: ok")
+
+
 def test_invisible_layer_flag() -> None:
     """Блоки невидимого слоя распознаются по char_flags; видимый текст — нет."""
     with tempfile.TemporaryDirectory() as d:
@@ -888,6 +924,7 @@ if __name__ == "__main__":
     test_ocr_page_abort_policy()
     test_invisible_layer_flag()
     test_ocr_edit_clears_raster()
+    test_table_blocks_split()
     test_ocr_clean_text()
     test_ocr_parse_reply()
     test_ocr_style_mapping()

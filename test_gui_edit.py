@@ -382,6 +382,29 @@ noise_after = _capture2(_gtk_noise)
 check("14. шум GTK до глушителя виден", "GLib-GObject" in noise_before)
 check("14. шум GTK после глушителя нет", noise_after == "")
 
+# --- 16. таблица: блоки по ячейкам + «Копировать текст» правым кликом
+_tbl = pymupdf.open()
+_p = _tbl.new_page(width=300, height=140)
+for _y in (30, 60, 90):
+    _p.draw_line((30, _y), (270, _y), color=(0, 0, 0), width=1)
+for _x in (30, 150, 270):
+    _p.draw_line((_x, 30), (_x, 90), color=(0, 0, 0), width=1)
+for _cx, _cy, _t in [(55, 50, "Cell A1"), (175, 50, "Cell A2"),
+                     (55, 80, "Cell B1"), (175, 80, "Cell B2")]:
+    _p.insert_text((_cx, _cy), _t, fontname="helv", fontsize=10)
+_tpath = os.path.join(os.path.dirname(SAMPLE), "table.pdf")
+_tbl.save(_tpath); _tbl.close()
+WT = _window.MainWindow(pdf_path=_tpath)
+WT.resize(1280, 860)
+texts16 = {b.text for b in WT.blocks}
+check("16. блоки таблицы разбиты по ячейкам", all(
+    c in texts16 for c in ("Cell A1", "Cell A2", "Cell B1", "Cell B2")))
+idx16 = next(i for i, b in enumerate(WT.blocks) if b.text == "Cell B2")
+WT.copy_block_text(idx16)
+check("16. «Копировать текст» кладёт текст ячейки в буфер",
+      QApplication.clipboard().text() == "Cell B2")
+WT.close()
+
 #OFFSCREEN: диалог подтверждения закрытия модален — подменяем на "Да".
 QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
 WIN.close()  # closeEvent покажет подтверждение несохранённых правок

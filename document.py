@@ -186,19 +186,50 @@ class PdfDocument:
     def thumbnail_pixmap(self, idx: int) -> pymupdf.Pixmap:
         return self.page_pixmap(idx, zoom=0.2)
 
+    def _table_cells(self, page) -> list[pymupdf.Rect]:
+        """Ячейки всех таблиц страницы (find_tables по линиям сетки).
+        use_layout=False: детектор линий без гейта layout-анализа — тот
+        пропускает реальные таблицы (ломающее изменение pymupdf 1.28)."""
+        try:
+            tables = page.find_tables(use_layout=False).tables
+        except Exception:  # find_tables может упасть на повреждённой странице
+            return []
+        return [pymupdf.Rect(c) for t in tables for c in t.cells if c]
+
     def blocks(self, idx: int) -> list[TextBlock]:
-        out = []
-        for b in self.doc[idx].get_text("dict")["blocks"]:
+        page = self.doc[idx]
+        cells = self._table_cells(page)
+        out: list[TextBlock] = []
+
+        def make(lines: list) -> TextBlock:
+            """TextBlock из линий [(bbox, runs, invisible)]."""
+            first = next((r for _b, runs, _i in lines for r in runs), None)
+            if first is None:
+                return None
+            rect = pymupdf.Rect(lines[0][0])
+            for bbox, _runs, _inv in lines[1:]:
+                rect |= pymupdf.Rect(bbox)
+            return TextBlock(
+                rect=rect,
+                text="\n".join("".join(r["text"] for r in runs)
+                               for _b, runs, _i in lines),
+                font=first["font"],
+                size=first["size"],
+                color=first["color"],
+                line_runs=[runs for _b, runs, _i in lines],
+                invisible=all(inv for _b, _runs, inv in lines),
+            )
+
+        for b in page.get_text("dict")["blocks"]:
             if b["type"] != 0:
                 continue
-            line_runs = []
-            # Невидимый спан: ни filled, ни stroked (char_flags бит 3 и 4) —
-            # так вставляется текстовый слой OCR (render_mode 3).
-            invisible = all((s["char_flags"] & 0b11000) == 0
-                            for line in b["lines"] for s in line["spans"])
+            lines = []
             for line in b["lines"]:
                 runs = []
+                inv = True
                 for s in line["spans"]:
+                    if s["char_flags"] & 0b11000:
+                        inv = False
                     c = s["color"]
                     runs.append({
                         "font": s["font"],
@@ -211,21 +242,29 @@ class PdfDocument:
                         # \xa0 попадает в редактор и в следующие вставки.
                         "text": s["text"].replace("\xa0", " "),
                     })
-                line_runs.append(runs)
-            text = "\n".join("".join(r["text"] for r in runs)
-                             for runs in line_runs)
-            first = next((r for runs in line_runs for r in runs), None)
-            if not text or first is None:
+                lines.append((line["bbox"], runs, inv))
+            block = make(lines)
+            if block is None:
                 continue
-            out.append(TextBlock(
-                rect=pymupdf.Rect(b["bbox"]),
-                text=text,
-                font=first["font"],
-                size=first["size"],
-                color=first["color"],
-                line_runs=line_runs,
-                invisible=invisible,
-            ))
+            # Блок, чьи строки попадают в ячейки таблицы, разбивается по
+            # ячейкам (отдельный блок = копируемая ячейка). Разбиваем только
+            # если ВСЕ строки попали в ячейки и их больше одной ячейки —
+            # обычный текст на ячейку не похож и не теряется.
+            if cells:
+                by_cell: dict[pymupdf.Rect, list] = {}
+                ok = True
+                for bbox, runs, inv in lines:
+                    mid = pymupdf.Point((bbox[0] + bbox[2]) / 2,
+                                        (bbox[1] + bbox[3]) / 2)
+                    key = next((c for c in cells if c.contains(mid)), None)
+                    if key is None:
+                        ok = False
+                        break
+                    by_cell.setdefault(key, []).append((bbox, runs, inv))
+                if ok and len(by_cell) > 1:
+                    out.extend(make(g) for g in by_cell.values())
+                    continue
+            out.append(block)
         return out
 
     def embedded_font_names(self) -> list[str]:

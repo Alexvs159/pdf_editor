@@ -94,7 +94,7 @@ class BlockItem(QGraphicsRectItem):
         menu.addAction("Копировать", lambda: self.win.copy_block_text(idx))
         menu.addAction("Вырезать", lambda: self.win.cut_block_text(idx))
         menu.addAction("Удалить", lambda: self.win.delete_block_text(idx))
-        menu.exec(event.globalPos())
+        menu.exec(event.screenPos())
 
     def mousePressEvent(self, event) -> None:
         self._press = self.pos()
@@ -265,7 +265,6 @@ class MainWindow(QMainWindow):
         # редактора выключается — иначе «съедает» копирование выделения
         # внутри оверлея.
         self.copy_sc = QShortcut(QKeySequence("Ctrl+C"), self, self._copy_selected)
-        self.copy_sc.setEnabled(False)
 
         menu = self.menuBar().addMenu("&Файл")
         act_open = QAction("&Открыть…", self)
@@ -678,6 +677,7 @@ class MainWindow(QMainWindow):
         self.overlay = None
         self.overlay_bg = None
         self.overlay_idx = None
+        self.copy_sc.setEnabled(True)  # оверлей закрыт — Ctrl+C снова у блока
         self.select_page(self.page_idx)
         item = self.thumbs.currentItem()
         if item is not None:

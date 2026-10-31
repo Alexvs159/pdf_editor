@@ -414,6 +414,21 @@ QApplication.clipboard().setText("")
 WIN._copy_selected()
 check("17. Ctrl+C копирует текст выделенного блока",
       QApplication.clipboard().text() == WIN.blocks[item17.data(0)].text)
+check("17. Ctrl+C доступен без открытия редактора", WIN.copy_sc.isEnabled())
+
+# Контекстное меню: exec подменяем (модален), вызываем само событие с
+# заглушкой позиции — проверяем и состав пунктов, и корректный screenPos
+# (сломанный globalPos в PyQt6 ронял программу SIGABRT).
+from types import SimpleNamespace
+from PyQt6.QtCore import QPoint
+from PyQt6.QtWidgets import QMenu
+_qmenu_exec, texts17 = QMenu.exec, []
+QMenu.exec = lambda self, *a, **k: (
+    texts17.extend(a.text() for a in self.actions()), None)[1]
+item17.contextMenuEvent(SimpleNamespace(screenPos=lambda: QPoint(1, 1)))
+QMenu.exec = _qmenu_exec
+check("17. меню: Копировать/Вырезать/Удалить",
+      texts17 == ["Копировать", "Вырезать", "Удалить"])
 
 WIN.start_edit(item17)
 check("17. при открытом редакторе Ctrl+C выключен", not WIN.copy_sc.isEnabled())

@@ -77,11 +77,11 @@ check("2. текст оверлея = block.text",
 pos_ok = abs(ov.pos().x() - orig.rect.x0 * 2.0) < 1 and abs(ov.pos().y() - orig.rect.y0 * 2.0) < 1
 check("2. оверлей на месте блока", pos_ok)
 check("2. фокус в оверлее", WIN.scene.focusItem() is ov)
-# Кегль оверлея = кегль блока: em в элементных px = пункту страницы,
-# иначе редактор «раздувает» текст относительно страницы.
+# Кегль оверлея = кегль блока в px сцены (сцена × VIEW_ZOOM): иначе
+# редактор рисует текст мельче/крупнее страницы.
 fpx = ov.font().pixelSize()
 check("2. кегль оверлея = кеглю блока",
-      fpx == max(1, round(orig.size)) and fpx < round(orig.size * 1.5))
+      fpx == max(1, round(orig.size * 2.0)))
 
 # --- 2b. одиночный клик — панель появляется при выделении
 sel_item = find_block(t0.split("\n")[0][:10])
@@ -419,22 +419,23 @@ _fitem = next(it for it in WF.scene.items()
 WF.start_edit(_fitem)
 check("18. оверлей встроенным TTF (точная гарнитура)",
       WF.overlay is not None and WF.overlay.font().family() == "DejaVu Sans")
-check("18. кегль точно как в блоке",
-      WF.overlay.font().pixelSize() == round(WF.blocks[0].size))
+check("18. кегль точно как в блоке (px сцены × VIEW_ZOOM)",
+      WF.overlay.font().pixelSize() == round(WF.blocks[0].size * 2.0))
 WF.cancel_edit()
 # Base-14: буфера нет — остаётся подмена по имени, кегль всё равно точен
 _hitem = next(it for it in WIN.scene.items() if isinstance(it, BlockItem)
               and it.data(0) == 0)
 WIN.start_edit(_hitem)
-check("18. кегль оверлея Base-14 тоже 1:1",
+check("18. кегль оверлея Base-14 тоже 1:1 со страницей",
       WIN.overlay is not None
-      and WIN.overlay.font().pixelSize() == round(WIN.blocks[0].size))
+      and WIN.overlay.font().pixelSize() == round(WIN.blocks[0].size * 2.0))
 WIN.cancel_edit()
 
 # --- 17. Ctrl+C на выделенном блоке; Копировать/Вырезать/Удалить
 item17 = next(it for it in WIN.scene.items()
               if isinstance(it, BlockItem) and it.data(0) < len(WIN.blocks))
-item17.setSelected(True)
+WIN.scene.clearSelection()  # после 18 остаётся выделение; selectedItems()[0]
+item17.setSelected(True)    # недетерминирован при двух выбранных блоках
 WIN.on_block_selected()
 QApplication.clipboard().setText("")
 WIN._copy_selected()

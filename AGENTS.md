@@ -76,7 +76,8 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
   - `_qt_family` — семейство Qt для шрифта блока: буфер встроенного TTF/OTF
     грузится `QFontDatabase.addApplicationFontFromData` (кэш по имени);
     Base-14 буфера не имеет — подмена по имени. `start_edit` ставит этот
-    шрифт оверлею с кеглем 1:1 блока (`setPixelSize(round(size))`).
+    шрифт оверлею с кеглем 1:1 блока в px сцены
+    (`setPixelSize(round(size * VIEW_ZOOM))`).
   - `scene_rect` — rect рамки в координатах PDF; `_submit` — единая точка
     применения (undo-снимок → `set_text` → перерисовка страницы).
   - `_snapshot` — undo-снимок: не больше 20 шагов и 64 МБ суммарно.
@@ -302,8 +303,8 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
   сопоставляются без пробелов) грузится в Qt через
   `QFontDatabase.addApplicationFontFromData` (`_qt_family`, кэш) — точная
   гарнитура. Base-14 буфера не имеет (ext == n/a) — подмена Qt по имени,
-  кегль всё равно точен: `setPixelSize(round(size))`, 1px = 1 пункт
-  страницы при любом zoom и DPI.
+  кегль всё равно точен: `setPixelSize(round(size * VIEW_ZOOM))` — пиксели
+  сцены, сцена в `VIEW_ZOOM` px на пункт, от DPI не зависит.
 - Вставка встроенным субсетом перекодирует дефис `-` в мягкий перенос
   `\xad`: текст на странице выглядит верно, но `blocks()` вернёт его с `\xad`
   (артефакт MuPDF, был и раньше; `\xa0` нормализуется, `\xad` — нет).
@@ -363,3 +364,6 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
   кодируется, нужен буфер системного TTF (`PDF_OCR_FONT` → DejaVu/Liberation/
   Noto); на этой машине DejaVu лежит в `/usr/share/fonts/TTF`, регулярный
   кириллический — `Noto/NotoSans-Regular.ttf`.
+- «В inline-редакторе шрифт мельче, чем на странице» — `setPixelSize(size)`
+  без `VIEW_ZOOM`; сцена в 2 px на пункт, кегль должен быть `size*VIEW_ZOOM`
+  (покрыто смоками 2 и 18 в `test_gui_edit.py`).

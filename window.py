@@ -624,12 +624,13 @@ class MainWindow(QMainWindow):
             rect, pen=QPen(Qt.PenStyle.NoPen), brush=QColor(255, 255, 255))
         t = QGraphicsTextItem()
         # Гарнитура оверлея: встроенный TTF/OTF шрифта блока грузится через
-        # QFontDatabase — точная гарнитура и пропорции, кегль 1:1 с блоком
-        # (1px = 1 пункт страницы при любом zoom и DPI). Base-14 буфера не
-        # имеют — подмена Qt по имени (кегль всё равно точен).
+        # QFontDatabase — точная гарнитура и пропорции. Кегль в px сцены:
+        # сцена масштабирована VIEW_ZOOM (1 пункт страницы = VIEW_ZOOM px),
+        # поэтому text = size * VIEW_ZOOM — визуально 1:1 с блоком при
+        # любом DPI (QFont.pixelSize не зависит от DPI).
         fam = self._qt_family(b.font)
         f = QFont(fam) if fam else QFont(_clean_font_name(b.font))
-        f.setPixelSize(max(1, round(b.size)))
+        f.setPixelSize(max(1, round(b.size * VIEW_ZOOM)))
         t.setFont(f)
         t.setDefaultTextColor(QColor(0, 0, 0))
         t.setPlainText(b.text)

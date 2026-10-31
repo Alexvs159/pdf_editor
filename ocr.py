@@ -65,26 +65,40 @@ def detect_text_blocks(samples: bytes, width: int, height: int,
     rows = dark.sum(axis=1)
     # Почти сплошные тёмные ряды — линейки/разделители таблиц, не текст.
     full = 0.6 * width
+    rule_rows = np.flatnonzero(rows >= full)
+    # Низкий порог: высокие ascender-ряды тонкой строки дают всего пару
+    # тёмных пикселей. От вертикальных линий рамок защищают: обрезка
+    # rule-колонок в _line_boxes, cap высоты и сортировка по Y.
     runs = _consecutive_rows(np.flatnonzero((rows >= 2) & (rows < full)))
+    runs = _split_at_valleys(runs, rows)
     boxes = _line_boxes(runs, dark)
     if not boxes:
         return []
     med_h = float(np.median([y1 - y0 for _x, y0, _x2, y1 in boxes]))
-    # Крапинки/артефакты: линия сильно мельче остального текста.
-    # shortcut: крупный рисунок (высота > 4×медианы) не отбрасывается —
-    # апгрейд при проблемах с колонтитулами-логотипами.
-    boxes = [b for b in boxes if b[3] - b[1] >= max(0.35 * med_h, 6)]
-    return _group_blocks(sorted(boxes), zoom, dark)
+    # Крапинки/артефакты — ниже медианной строки; крупные сплошные блоки
+    # (штрих-код, рисунки, логотипы) — намного выше текстовой строки.
+    # shortcut: широкий заголовок > 3.5× медианы отбросится; апгрейд —
+    # классификация по плотности/аспекту.
+    boxes = [b for b in boxes
+             if max(0.35 * med_h, 6) <= b[3] - b[1] <= 3.5 * med_h]
+    # Порядок строк — чтения (сверху вниз), НЕ по x: иначе группировка
+    # абзацев идёт вперемешку между колонками и склеивает дальние строки.
+    return _group_blocks(sorted(boxes, key=lambda b: (b[1], b[0])),
+                         zoom, dark, rule_rows)
 
 
 def _consecutive_rows(idx: np.ndarray) -> list[tuple[int, int]]:
-    """Индексы рядов → отрезки [start, end), слияние зазора < 3 рядов."""
+    """Индексы рядов → отрезки [start, end) по НЕПРЕРЫВНЫМ рядам.
+
+    Склеивать через пустые ряды нельзя: зазор между строками текста на
+    zoom=2 бывает 1–3 px, и соседние строки сливались в одну «мега-строку»
+    (блоки во всю страницу, перекрытия)."""
     idx = [int(i) for i in idx]
     if not idx:
         return []
     out, start, prev = [], idx[0], idx[0]
     for r in idx[1:]:
-        if r - prev > 3:
+        if r != prev + 1:
             out.append((start, prev + 1))
             start = r
         prev = r
@@ -92,27 +106,88 @@ def _consecutive_rows(idx: np.ndarray) -> list[tuple[int, int]]:
     return out
 
 
+def _split_at_valleys(runs: list[tuple[int, int]],
+                      rows: np.ndarray) -> list[tuple[int, int]]:
+    """Резать «слипшиеся» строки в долине профиля.
+
+    Строки соседних ячеек таблицы стоят на разной высоте: полностью пустых
+    рядов между ними нет, и две текстовые строки сливались в одну
+    (высота ≈ 2× медианной). Режем только такие пробеги — по минимуму
+    профиля в средней трети — не трогая аскендеры/десцендеры одной строки."""
+    med = float(np.median([b - a for a, b in runs]))
+    out: list[tuple[int, int]] = []
+    stack = list(runs)
+    while stack:
+        y0, y1 = stack.pop(0)
+        h = y1 - y0
+        if h <= 1.6 * med:
+            out.append((y0, y1))
+            continue
+        prof = rows[y0:y1]
+        lo, hi = int(h * 0.3), max(int(h * 0.3) + 1, int(h * 0.7))
+        i = lo + int(np.argmin(prof[lo:hi]))
+        if prof[i] >= 0.6 * prof.max():
+            out.append((y0, y1))
+            continue
+        stack[0:0] = [(y0, y0 + i + 1), (y0 + i + 1, y1)]
+    return sorted(out)
+
+
 def _line_boxes(runs: list[tuple[int, int]], dark: np.ndarray
                 ) -> list[tuple[int, int, int, int]]:
-    """(y0,y1) → (x0,y0,x1,y1): обрезка пустых полей по колонкам."""
+    """(y0,y1) → (x0,y0,x1,y1): обрезка пустых полей и линий рамок.
+
+    Вертикальная линия рамки — тонкая (≤2 px) колонка, тёмная по всей
+    высоте строки и отделённая большим зазором от текста. Глифовый штрих
+    ('l', 'i') тоже тонкий и высокий, но стоит вплотную к соседнему глифу,
+    поэтому по зазору не режется (иначе bbox съезжал на 3pt)."""
     out = []
     for y0, y1 in runs:
-        xs = np.flatnonzero(dark[y0:y1].sum(axis=0) >= 1)
-        if len(xs) == 0 or xs[-1] + 1 - xs[0] < 8:
+        sub = dark[y0:y1]
+        h = y1 - y0
+        cols = sub.sum(axis=0)
+        groups = _ink_groups(cols >= 1)
+        if not groups:
             continue
-        out.append((int(xs[0]), y0, int(xs[-1]) + 1, y1))
+        while len(groups) > 1 and _is_rule_group(
+                groups[0], cols, h) and groups[1][0] - groups[0][1] >= 0.3 * h:
+            groups.pop(0)
+        while len(groups) > 1 and _is_rule_group(
+                groups[-1], cols, h) and groups[-1][0] - groups[-2][1] >= 0.3 * h:
+            groups.pop()
+        x0, x1 = groups[0][0], groups[-1][1]
+        if x1 - x0 < 8:
+            continue
+        out.append((int(x0), y0, int(x1), y1))
     return out
 
 
+def _ink_groups(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Непрерывные группы колонок с чернилами → [(start, end), ...]."""
+    edges = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    return [(int(a), int(b)) for a, b in zip(starts, ends)]
+
+
+def _is_rule_group(group: tuple[int, int], cols: np.ndarray,
+                   h: int) -> bool:
+    a, b = group
+    return b - a <= 2 and bool(np.all(cols[a:b] >= 0.9 * h))
+
+
 def _group_blocks(lines: list[tuple[int, int, int, int]], zoom: float,
-                  dark: np.ndarray) -> list[OcrBlock]:
+                  dark: np.ndarray, rule_rows: np.ndarray) -> list[OcrBlock]:
     """Строки → абзацы: вертикальный зазор < 0.8 высоты строки И
-    горизонтальное перекрытие ≥ 50% меньшей ширины (колонки не сцепляются).
+    горизонтальное перекрытие ≥ 50% меньшей ширины (колонки не сцепляются),
+    и между строками нет горизонтальной линейки (строки таблицы — отдельные
+    блоки, а не гигантский абзац на всю таблицу).
     Координаты переводятся из пикселей зума в пункты PDF."""
     med_h = float(np.median([y1 - y0 for _x, y0, _x2, y1 in lines]))
     groups: list[list[tuple[int, int, int, int]]] = []
     for ln in lines:
-        if not groups or not _same_para(groups[-1][-1], ln, med_h):
+        if not groups or not _same_para(groups[-1][-1], ln, med_h,
+                                        rule_rows):
             groups.append([ln])
         else:
             groups[-1].append(ln)
@@ -123,7 +198,12 @@ def _group_blocks(lines: list[tuple[int, int, int, int]], zoom: float,
                             max(l[2] for l in g) * z, max(l[3] for l in g) * z)
         line_rects = [pymupdf.Rect(l[0] * z, l[1] * z, l[2] * z, l[3] * z)
                       for l in g]
-        size = float(np.median([(l[3] - l[1]) / 0.9 for l in g])) * z
+        ink_px = float(np.median([(l[3] - l[1]) / 0.9 for l in g]))
+        # Размер по межстрочному шагу (leading ~1.2): по высоте чернил он
+        # занижен (x-height), и MuPDF из-за этого дробит абзац на строки.
+        pitches = [g[i + 1][1] - g[i][1] for i in range(len(g) - 1)]
+        pitch_px = float(np.median(pitches)) if pitches else 0.0
+        size = max(pitch_px / 1.2, ink_px) * z
         out.append(OcrBlock(rect=rect, text="", size=size, lines=line_rects,
                             style=_estimate_style(dark, g)))
     return out
@@ -164,9 +244,12 @@ def _estimate_style(dark: np.ndarray,
     return style
 
 
-def _same_para(prev: tuple, ln: tuple, med_h: float) -> bool:
+def _same_para(prev: tuple, ln: tuple, med_h: float,
+               rule_rows: np.ndarray) -> bool:
     gap = ln[1] - prev[3]
     overlap = min(prev[2], ln[2]) - max(prev[0], ln[0])
+    if np.any((rule_rows >= prev[3]) & (rule_rows < ln[1])):
+        return False  # между строками линейка — не абзац
     return (gap < 0.8 * med_h
             and overlap >= 0.5 * min(prev[2] - prev[0], ln[2] - ln[0]))
 

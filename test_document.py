@@ -618,20 +618,27 @@ def test_save_unwritable_raises() -> None:
 _OCR_ZOOM = 2.0
 
 
+def _ocr_source_page() -> pymupdf.Page:
+    """Страница с двумя абзацами по две строки (источник растра для OCR)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    for x, y, t in ((70, 90, "line one text"), (70, 103, "line two text"),
+                    (70, 190, "second para first"),
+                    (70, 203, "second second")):
+        page.insert_text((x, y), t, fontname="helv", fontsize=11)
+    return page
+
+
+def _ocr_expected() -> list[pymupdf.Rect]:
+    return [pymupdf.Rect(b["bbox"])
+            for b in _ocr_source_page().get_text("dict")["blocks"]
+            if b["type"] == 0]
+
+
 def _ocr_raster() -> pymupdf.Pixmap:
-    """Растр примера страницы: два абзаца по две строки (тёмные полосы)."""
-    W, H = 595, 842
-    img = np.full((int(H * _OCR_ZOOM), int(W * _OCR_ZOOM), 3), 255,
-                  dtype=np.uint8)
-    for y_pt, lines in ((80, ["line one text", "line two text"]),
-                        (180, ["second para first", "second second"])):
-        for i, txt in enumerate(lines):
-            y0 = int((y_pt + i * 17) * _OCR_ZOOM)
-            h = int(11 * _OCR_ZOOM)
-            x1 = int(70 * _OCR_ZOOM) + int(len(txt) * 11 * 0.55 * _OCR_ZOOM)
-            img[y0:y0 + h, int(70 * _OCR_ZOOM):x1] = 0
-    return pymupdf.Pixmap(pymupdf.csRGB, img.shape[1], img.shape[0],
-                          img.tobytes(), 0)
+    """Растр примера страницы: реальный рендер текста (настоящие глифы)."""
+    return _ocr_source_page().get_pixmap(
+        matrix=pymupdf.Matrix(_OCR_ZOOM, _OCR_ZOOM), alpha=False)
 
 
 def _ocr_pdf(path: str) -> None:
@@ -646,17 +653,21 @@ def _ocr_pdf(path: str) -> None:
 
 
 def test_ocr_detection_synthetic() -> None:
-    blocks = ocr.detect_text_blocks(_ocr_raster().samples,
-                                   _ocr_raster().width,
-                                   _ocr_raster().height, _OCR_ZOOM)
-    assert len(blocks) == 2, "две строки абзаца склеиваются в блок"
-    got = [tuple(round(v, 1) for v in b.rect) for b in blocks]
-    want = [(70.0, 80.0, 148.5, 108.0), (70.0, 180.0, 172.5, 208.0)]
-    for g, w in zip(got, want):
-        assert all(abs(a - b) <= 1.0 for a, b in zip(g, w)), f"{g} != {w}"
-        assert len(g) == 4
-    assert all(len(b.lines) == 2 for b in blocks)
-    assert 11.0 <= blocks[0].size <= 14.0, "размер строки ~11pt из высоты"
+    pm = _ocr_raster()
+    blocks = ocr.detect_text_blocks(pm.samples, pm.width, pm.height,
+                                    _OCR_ZOOM)
+    assert len(blocks) == 2, f"два абзаца, получено {len(blocks)}"
+    expected = _ocr_expected()
+    assert len(expected) == 2
+    for got, want in zip(blocks, expected):
+        assert len(got.lines) == 2, "две строки в абзаце"
+        # x — по чернилам, совпадает с глифами; y-рамка pymupdf включает
+        # метрики шрифта (ascender/descender), поэтому допуск шире.
+        assert abs(got.rect.x0 - want.x0) <= 2.0, f"x0 {list(got.rect)}"
+        assert abs(got.rect.x1 - want.x1) <= 2.0, f"x1 {list(got.rect)}"
+        assert abs(got.rect.y0 - want.y0) <= 6.0, f"y0 {list(got.rect)}"
+        assert abs(got.rect.y1 - want.y1) <= 6.0, f"y1 {list(got.rect)}"
+        assert 10.0 <= got.size <= 16.0, "размер ~11pt"
     print("test_ocr_detection_synthetic: ok")
 
 
@@ -848,6 +859,43 @@ def test_ocr_page_abort_policy() -> None:
         print("test_ocr_page_abort_policy: ok")
 
 
+def test_ocr_rule_barrier() -> None:
+    """Горизонтальная линейка между строками не даёт склеить их в абзац."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=200)
+    page.insert_text((30, 60), "First line", fontname="helv", fontsize=11)
+    page.insert_text((30, 72), "Second line", fontname="helv", fontsize=11)
+    page.draw_line(pymupdf.Point(10, 66), pymupdf.Point(290, 66), width=1)
+    pm = page.get_pixmap(matrix=pymupdf.Matrix(_OCR_ZOOM, _OCR_ZOOM),
+                         alpha=False)
+    blocks = ocr.detect_text_blocks(pm.samples, pm.width, pm.height,
+                                    _OCR_ZOOM)
+    assert len(blocks) == 2, f"линейка должна разделить блоки: {len(blocks)}"
+    print("test_ocr_rule_barrier: ok")
+
+
+def test_ocr_padded_width() -> None:
+    """Ширина bbox вставленного блока = ширине детекции (добивка пробелами),
+    а хвостовые пробелы в текст модели не попадают."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.pdf")
+        _ocr_pdf(path)
+        pd = PdfDocument(path)
+        det = ocr.detect_text_blocks(_ocr_raster().samples,
+                                     _ocr_raster().width,
+                                     _ocr_raster().height, _OCR_ZOOM)
+        for i, b in enumerate(det):
+            b.text = f"ab{i}"  # короткий текст: bbox уже детекции
+        pd.apply_ocr(0, det)
+        got = min((b for b in pd.blocks(0)),
+                  key=lambda b: abs(b.rect.y0 - det[0].rect.y0))
+        assert abs(got.rect.width - det[0].rect.width) <= 3.0, \
+            f"ширина bbox {got.rect.width:.1f} != {det[0].rect.width:.1f}"
+        assert got.text.startswith("ab0"), repr(got.text)
+        assert got.text == got.text.rstrip(), "хвостовые пробелы не нужны"
+        print("test_ocr_padded_width: ok")
+
+
 def test_ocr_clean_text() -> None:
     assert ocr._clean_text("привет") == "привет"
     assert ocr._clean_text("```json\nпривет\n```") == "привет"
@@ -949,6 +997,8 @@ if __name__ == "__main__":
     test_table_blocks_split()
     test_embedded_font_buffer()
     test_ocr_clean_text()
+    test_ocr_rule_barrier()
+    test_ocr_padded_width()
     test_ocr_parse_reply()
     test_ocr_style_mapping()
     test_ocr_style_heuristics()

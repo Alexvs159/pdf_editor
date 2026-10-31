@@ -227,10 +227,16 @@ class PdfDocument:
             for line in b["lines"]:
                 runs = []
                 inv = True
-                for s in line["spans"]:
+                spans = line["spans"]
+                for j, s in enumerate(spans):
                     if s["char_flags"] & 0b11000:
                         inv = False
                     c = s["color"]
+                    t = s["text"].replace("\xa0", " ")
+                    if j == len(spans) - 1:
+                        # Хвостовые пробелы последнего спана — добивка
+                        # ширины OCR-строки до растра (apply_ocr).
+                        t = t.rstrip()
                     runs.append({
                         "font": s["font"],
                         "size": s["size"],
@@ -240,7 +246,7 @@ class PdfDocument:
                         # shortcut: TTF-буферы с LATIN-кодировкой извлекают
                         # пробел как \xa0 (артефакт MuPDF); нормализуем, иначе
                         # \xa0 попадает в редактор и в следующие вставки.
-                        "text": s["text"].replace("\xa0", " "),
+                        "text": t,
                     })
                 lines.append((line["bbox"], runs, inv))
             block = make(lines)
@@ -560,25 +566,53 @@ class PdfDocument:
             ln_texts = [ln for ln in b.text.split("\n") if ln]
             if not ln_texts:
                 continue
-            font_name = self._ocr_font(page, "".join(b.text), b.style,
-                                       font_path=font_path)
+            font_name, font_buf = self._ocr_font(
+                page, "".join(b.text), b.style, font_path=font_path)
+            # Ширина bbox блока в PDF считается по метрикам ВСТАВЛЕННОГО
+            # текста, а не по расту. Добиваем строку пробелами до ширины
+            # детекции — иначе рамка/подложка редактора уже растра и старый
+            # текст остаётся виден вокруг правки.
+            font_obj = pymupdf.Font(fontbuffer=font_buf) if font_buf else None
+
+            def pad(text: str, width: float) -> str:
+                if width <= 0:
+                    return text
+                try:
+                    w = (font_obj.text_length(text, fontsize=b.size)
+                         if font_obj is not None else
+                         pymupdf.get_text_length(text, fontname=font_name,
+                                                 fontsize=b.size))
+                    sw = (font_obj.text_length(" ", fontsize=b.size)
+                          if font_obj is not None else
+                          pymupdf.get_text_length(" ", fontname=font_name,
+                                                  fontsize=b.size))
+                except Exception:
+                    return text  # метрики неизвестны (reserved CJK) — без pad
+                if width <= w or sw <= 0:
+                    return text
+                return text + " " * int((width - w) / sw)
+
             if len(ln_texts) == len(b.lines):
                 baselines = [r.y1 - 0.2 * b.size for r in b.lines]
+                widths = [r.width for r in b.lines]
             elif len(ln_texts) == 1:
                 baselines = [b.rect.y1 - 0.2 * b.size]
+                widths = [b.rect.width]
             else:
                 y_first = b.rect.y0 + 0.75 * b.size
                 y_last = b.rect.y1 - 0.2 * b.size
                 step = (y_last - y_first) / (len(ln_texts) - 1)
                 baselines = [y_first + i * step
                              for i in range(len(ln_texts))]
-            for y, ln in zip(baselines, ln_texts):
-                page.insert_text((b.rect.x0, y), ln, fontname=font_name,
-                                 fontsize=b.size, render_mode=3)
+                widths = [b.rect.width] * len(ln_texts)
+            for y, w, ln in zip(baselines, widths, ln_texts):
+                page.insert_text((b.rect.x0, y), pad(ln, w),
+                                 fontname=font_name, fontsize=b.size,
+                                 render_mode=3)
 
     def _ocr_font(self, page, text: str, style: dict,
-                  font_path: str | None = None) -> str:
-        """refname шрифта невидимого слоя по скрипту текста и начертанию.
+                  font_path: str | None = None) -> tuple[str, bytes | None]:
+        """refname и буфер шрифта невидимого слоя по скрипту и начертанию.
 
         htmlbox (кириллица не влезает в Base-14) здесь не вариант: он
         вставляется видимым. Не-ASCII скрипты — системный TTF с шрифтовой
@@ -588,13 +622,13 @@ class PdfDocument:
                for c in text):
             buf = _cyr_font_buffer(font_path)
             page.insert_font(fontname="OcrFSil", fontbuffer=buf)
-            return "OcrFSil"
+            return "OcrFSil", buf
         cjk = _cjk_font(text)
         if cjk:
-            return cjk
+            return cjk, None
         name = " ".join(k for k in ("serif", "mono", "bold", "italic")
                         if style.get(k))
-        return _base14_key(name)
+        return _base14_key(name), None
 
 
 # Порядок кандидатов: Linux → Windows → macOS. Все — регулярные начертания

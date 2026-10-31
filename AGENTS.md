@@ -122,7 +122,7 @@ vision-LLM API (OpenAI-совместимый). Левая панель — ми
 ## Граф кода (codebase-memory)
 
 Проект проиндексирован в codebase-memory-mcp (проект `pdf_editor`, full-режим,
-272 узла / 1244 ребра, генерация 2026-10-30T11:45:32Z). MCP-сервер
+267 узлов / 1258 рёбер, генерация 2026-10-31T09:38:07Z). MCP-сервер
 `codebase-memory` подключён на project-local scope
 (`~/.commandcode/projects/<slug>/mcp.json`, команда
 `/home/alex/.local/bin/codebase-memory-mcp`). Анализ кода — graph-first,
